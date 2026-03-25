@@ -36,6 +36,9 @@ from dimos.robot.drone.tello_sdk import TelloSdkClient
 from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
+TRACKING_START_STATUSES = {"tracking", "not_found", "failed", "lost"}
+TRACKING_STOP_STATUSES = {"stopped", "not_found", "failed", "lost"}
+HOVER_OVERRIDE_SEC = 1.0
 
 
 def _add_disposable(composite: CompositeDisposable, item: Disposable | Any) -> None:
@@ -71,6 +74,7 @@ class TelloConnectionModule(Module):
     telemetry: Out[Any]
     video: Out[Image]
     follow_object_cmd: Out[Any]
+    range_measurement: Out[Any]
 
     # Parameters
     tello_ip: str
@@ -87,6 +91,7 @@ class TelloConnectionModule(Module):
     _latest_status: dict[str, Any] | None = None
     _latest_telemetry: dict[str, Any] | None = None
     _latest_tracking_status: dict[str, Any] | None = None
+    _latest_range_measurement: dict[str, Any] | None = None
     _state_lock: threading.RLock
 
     def __init__(
@@ -126,6 +131,7 @@ class TelloConnectionModule(Module):
         self._latest_status = None
         self._latest_telemetry = None
         self._latest_tracking_status = None
+        self._latest_range_measurement = None
         self._state_lock = threading.RLock()
         self._manual_override_until = 0.0
         Module.__init__(self, *args, **kwargs)
@@ -156,6 +162,9 @@ class TelloConnectionModule(Module):
         )
         _add_disposable(
             self._disposables, self.connection.video_stream().subscribe(self._store_and_publish_frame)
+        )
+        _add_disposable(
+            self._disposables, self.connection.ext_tof_stream().subscribe(self._publish_range_measurement)
         )
 
         _add_disposable(self._disposables, self.movecmd.subscribe(self._on_move))
@@ -233,22 +242,55 @@ class TelloConnectionModule(Module):
         if data is not None:
             with self._state_lock:
                 self._latest_tracking_status = data
+            value = data.get("status")
+            if isinstance(value, str):
+                if value == "tracking" and self.connection is not None:
+                    self.connection.start_ext_tof_polling()
+                elif value in TRACKING_STOP_STATUSES and self.connection is not None:
+                    self.connection.stop_ext_tof_polling()
+
+    def _publish_range_measurement(self, measurement: dict[str, Any]) -> None:
+        with self._state_lock:
+            self._latest_range_measurement = dict(measurement)
+        if self.range_measurement.transport:
+            self.range_measurement.publish(String(json.dumps(measurement)))
 
     def _wait_for_tracking_status(
-        self, timeout: float
+        self,
+        timeout: float,
+        accepted_statuses: set[str] | None = None,
     ) -> tuple[str | None, dict[str, Any] | None]:
+        statuses = accepted_statuses or TRACKING_START_STATUSES
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self._state_lock:
                 status = dict(self._latest_tracking_status or {}) or None
             if status is not None:
                 value = status.get("status")
-                if isinstance(value, str) and value in {"tracking", "not_found", "failed", "lost"}:
+                if isinstance(value, str) and value in statuses:
                     return value, status
             time.sleep(0.05)
         with self._state_lock:
             status = dict(self._latest_tracking_status or {}) or None
         return None, status
+
+    def _publish_follow_command(self, command: dict[str, Any]) -> None:
+        self.follow_object_cmd.publish(String(json.dumps(command)))
+
+    def _request_tracking_stop(
+        self, timeout: float = HOVER_OVERRIDE_SEC
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        if not self.follow_object_cmd.transport:
+            return None, None
+
+        with self._state_lock:
+            self._latest_tracking_status = None
+
+        self._publish_follow_command({"command": "stop"})
+        return self._wait_for_tracking_status(
+            timeout=timeout,
+            accepted_statuses=TRACKING_STOP_STATUSES,
+        )
 
     def _wait_until_airborne(self, min_height_cm: float = 20.0, timeout: float = 12.0) -> bool:
         if not self.connection:
@@ -279,6 +321,30 @@ class TelloConnectionModule(Module):
         with self._state_lock:
             return dict(self._latest_telemetry or {})
 
+    @rpc
+    def send_manual_rc(
+        self,
+        left_right: int = 0,
+        forward_back: int = 0,
+        up_down: int = 0,
+        yaw: int = 0,
+        manual_override_sec: float = 0.35,
+    ) -> bool:
+        """Send a manual rc command and suppress tracking briefly.
+
+        Args:
+            left_right: Left/right channel in [-100, 100]. Positive is right.
+            forward_back: Forward/back channel in [-100, 100]. Positive is forward.
+            up_down: Vertical channel in [-100, 100]. Positive is up.
+            yaw: Yaw channel in [-100, 100]. Positive is clockwise.
+            manual_override_sec: How long to suppress autonomous Twist commands.
+                Use 0.0 to clear the manual override window immediately.
+        """
+        if not self.connection:
+            return False
+        self._manual_override_until = time.time() + max(0.0, manual_override_sec)
+        return self.connection.rc(left_right, forward_back, up_down, yaw)
+
     @skill
     def move(self, x: float = 0.0, y: float = 0.0, z: float = 0.0, duration: float = 0.0) -> str:
         """Move with body-frame velocity.
@@ -291,6 +357,7 @@ class TelloConnectionModule(Module):
         """
         if not self.connection:
             return "Failed: no Tello connection"
+        self._manual_override_until = time.time() + max(0.35, duration)
         ok = self.connection.move(Vector3(x, y, z), duration=duration)
         return "Move command sent" if ok else "Failed: move command rejected"
 
@@ -314,10 +381,17 @@ class TelloConnectionModule(Module):
         """
         if not self.connection:
             return "Failed: no Tello connection"
-        ok = self.connection.rc(left_right, forward_back, up_down, yaw)
+        override_sec = duration if duration > 0 else 0.35
+        ok = self.send_manual_rc(
+            left_right,
+            forward_back,
+            up_down,
+            yaw,
+            manual_override_sec=override_sec,
+        )
         if duration > 0:
             time.sleep(duration)
-            self.connection.rc(0, 0, 0, 0)
+            self.send_manual_rc(0, 0, 0, 0, manual_override_sec=0.0)
         return "RC command sent" if ok else "Failed: rc command rejected"
 
     @skill
@@ -372,12 +446,56 @@ class TelloConnectionModule(Module):
         return "Land command sent" if ok else "Failed: land rejected"
 
     @skill
+    def hover(self) -> str:
+        """Cancel autonomous motion and hold position.
+
+        Stops follow_object and center_person_by_yaw if they are active, then
+        sends zero-motion commands so the drone hovers in place ready for the
+        next command.
+        """
+        if not self.connection:
+            return "Failed: no Tello connection"
+
+        self.connection.stop_ext_tof_polling()
+        stop_status, _detail = self._request_tracking_stop(timeout=HOVER_OVERRIDE_SEC)
+        rc_ok = self.send_manual_rc(0, 0, 0, 0, manual_override_sec=HOVER_OVERRIDE_SEC)
+        sdk_stop_ok = self.connection.stop()
+
+        if stop_status in TRACKING_STOP_STATUSES:
+            return "Hover override sent; tracking was cancelled and the drone should hold position"
+        if rc_ok or sdk_stop_ok:
+            return "Hover override sent; the drone should hold position"
+        return "Failed: hover override rejected"
+
+    @skill
     def emergency_stop(self) -> str:
         """Emergency stop motors immediately."""
         if not self.connection:
             return "Failed: no Tello connection"
         ok = self.connection.emergency()
         return "Emergency command sent" if ok else "Failed: emergency rejected"
+
+    @skill
+    def flip(self, direction: str = "forward") -> str:
+        """Execute a flip maneuver.
+
+        Args:
+            direction: Flip direction. Supported values are forward, back, left,
+                right, or their single-letter aliases.
+        """
+        if not self.connection:
+            return "Failed: no Tello connection"
+
+        self.connection.stop_ext_tof_polling()
+        _status, _detail = self._request_tracking_stop(timeout=0.5)
+        _ = self.send_manual_rc(0, 0, 0, 0, manual_override_sec=0.75)
+        ok = self.connection.flip(direction)
+        if ok:
+            return f"Flip command sent in direction: {direction}"
+        return (
+            "Failed: flip rejected. Use direction forward, back, left, or right "
+            "and make sure the drone is airborne with enough clearance"
+        )
 
     @skill
     def send_ext(self, ext_command: str) -> str:
@@ -405,7 +523,8 @@ class TelloConnectionModule(Module):
 
         Args:
             object_description: Object to search for (for example "person").
-            distance_m: Desired following distance in meters (currently a hint only).
+            distance_m: Desired following distance in meters. TT follow uses the
+                extension TOF sensor when it has a valid reading.
             duration: Maximum follow duration in seconds once acquired. Also used as search budget.
             scan_step_deg: Yaw step used between search attempts.
             max_scan_steps: Number of scan attempts before giving up.
@@ -432,19 +551,23 @@ class TelloConnectionModule(Module):
                     self._latest_tracking_status = None
 
                 msg = {
+                    "command": "track",
                     "object_description": object_description,
                     "duration": follow_duration_s,
                     "distance_m": distance_m,
                     "control_mode": control_mode,
                 }
-                self.follow_object_cmd.publish(String(json.dumps(msg)))
+                self._publish_follow_command(msg)
 
                 time_left = max(0.2, step_deadline - time.time())
-                status, detail = self._wait_for_tracking_status(timeout=min(1.5, time_left))
+                status, detail = self._wait_for_tracking_status(
+                    timeout=min(1.5, time_left),
+                    accepted_statuses=TRACKING_START_STATUSES,
+                )
                 if status == "tracking":
                     return (
                         f"Following {object_description} for up to {follow_duration_s:.0f}s. "
-                        "Using fixed forward approach speed with yaw centering. "
+                        "Using TT TOF-assisted forward control with yaw centering when range is valid. "
                         f"Mode={control_mode}."
                     )
                 if status == "lost":
@@ -546,6 +669,7 @@ class TelloConnectionModule(Module):
     def stop(self) -> None:
         """Stop module and close the Tello connection."""
         if self.connection:
+            self.connection.stop_ext_tof_polling()
             self.connection.disconnect()
             self.connection = None
         logger.info("TelloConnectionModule stopped")

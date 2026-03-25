@@ -21,6 +21,9 @@ __getattr__, __dir__, __all__ = lazy.attach(
     submod_attrs={
         "camera_module": ["DroneCameraModule"],
         "connection_module": ["DroneConnectionModule"],
+        "tello_fleet_config": ["TelloDroneConfig"],
+        "tello_fleet_module": ["TelloFleetModule"],
+        "tello_gesture_control_module": ["TelloGestureControlModule"],
         "mavlink_connection": ["MavlinkConnection"],
         "tello_connection_module": ["TelloConnectionModule"],
         "tello_sdk": ["TelloSdkClient"],

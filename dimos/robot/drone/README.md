@@ -21,8 +21,10 @@ dimos run drone-basic --set outdoor=true
 dimos run drone-agentic
 
 # RoboMaster TT / Tello (Wi-Fi SDK)
-dimos run drone-tello-tt-basic --robot-ip 192.168.10.1
-dimos run drone-tello-tt-agentic --robot-ip 192.168.10.1 --disable web-input
+dimos --robot-ip 192.168.10.1 run drone-tello-tt-basic
+dimos --robot-ip 192.168.10.1 run drone-tello-tt-agentic --disable web-input
+dimos --robot-ips 192.168.1.9,192.168.1.10 run drone-tello-tt-fleet-agentic
+dimos --robot-ip 192.168.10.1 run drone-tello-tt-gesture
 ```
 
 To interact with the agent, run `dimos humancli` in a separate terminal.
@@ -88,8 +90,36 @@ Composes on top of `drone-tello-tt-basic`, adding:
 | Module | Purpose |
 |--------|---------|
 | `DroneTrackingModule` | Person detection, follow, yaw-centering, tracking overlay |
+| `TelloGestureControlModule` | Gesture recognition present but disabled by default; exposed through enable/disable skills |
 | `Agent` | LLM agent (default: GPT-4o) |
 | `WebInput` | Web/CLI interface for human commands |
+
+Say `enable gesture control` to hand control over to gestures, and `disable gesture control` when you want normal agent-only control again.
+
+### `drone-tello-tt-fleet-agentic`
+Segmented one-or-many Tello control behind a single agent-facing tool surface.
+
+Use the fleet operator guide for startup, IP discovery, interfaces, and command reference: [RoboMaster TT / Tello Fleet](/docs/usage/drone_tello_tt_fleet.md).
+
+| Module | Purpose |
+|--------|---------|
+| `TelloFleetModule` | Owns multiple Tello SDK clients, targeted skills, segmented-plan dispatch, and the multi-stream web interface |
+| `Agent` | LLM agent (default: GPT-4o) aware of the configured fleet |
+
+Use this mode when you want commands such as "drone 1 take off and move left while drone 2 rotates right." The command center serves one video feed per drone on `http://localhost:5555`.
+
+Multi-drone mode works with one laptop IP. DimOS assigns a unique local command/state/video port set to each drone and uses the Tello SDK `port` command so video and telemetry stay separated.
+
+`--robot-local-ips` is optional and can be used to pin all drones to one specific local interface/IP, for example `--robot-local-ips 192.168.1.7`.
+
+### `drone-tello-tt-gesture`
+Composes on top of `drone-tello-tt-basic`, adding:
+
+| Module | Purpose |
+|--------|---------|
+| `TelloGestureControlModule` | Mediapipe/TFLite hand-gesture recognition, overlay, and manual override RC control |
+
+This blueprint keeps the normal Tello connection stack but lets you fly with stable hand gestures from the live onboard camera feed. `Up` takes off while grounded, `Land` lands immediately, and dynamic clockwise/counter-clockwise finger motions issue yaw commands.
 
 ## Installation
 
@@ -127,6 +157,14 @@ export DIMOS_DRONE_YOLO_DEVICE=cuda:0   # or cpu
 export DIMOS_DRONE_YOLO_MODEL=yolo11s-pose.pt
 export DIMOS_DRONE_YOLO_IMGSZ=416
 export DIMOS_DRONE_YOLO_MAX_DET=5
+```
+
+### Optional Tello Gesture Runtime
+`drone-tello-tt-gesture` needs Mediapipe and a Lite runtime:
+
+```bash
+uv pip install mediapipe tensorflow
+# or: uv pip install mediapipe tflite-runtime
 ```
 
 ## RosettaDrone Setup (Critical)
@@ -194,14 +232,21 @@ dimos/robot/drone/
 ├── blueprints/
 │   ├── basic/drone_basic.py              # Base blueprint (connection + camera + vis)
 │   ├── basic/drone_tello_tt_basic.py     # Tello basic blueprint
+│   ├── basic/drone_tello_tt_gesture.py   # Tello gesture-control blueprint
 │   └── agentic/drone_agentic.py          # Agentic blueprint (composes on basic)
 │   └── agentic/drone_tello_tt_agentic.py # Tello agentic blueprint
+│   └── agentic/drone_tello_tt_fleet_agentic.py # Tello fleet agentic blueprint
 ├── connection_module.py                   # MAVLink communication & skills
 ├── camera_module.py                       # Camera processing & intrinsics
 ├── drone_tracking_module.py               # Visual servoing & object tracking
 ├── drone_visual_servoing_controller.py    # PID-based visual servoing
 ├── mavlink_connection.py                  # Low-level MAVLink protocol
 ├── tello_connection_module.py             # Tello module and skills
+├── tello_fleet_config.py                  # Multi-Tello config parsing and validation
+├── tello_fleet_module.py                  # Multi-Tello segmented control + web UI
+├── tello_gesture_control_module.py        # Hand-gesture recognition + manual override control
+├── tello_gesture_control_spec.py          # RPC surface for gesture control
+├── tello_gesture_assets/                  # Bundled TFLite models + labels
 ├── tello_sdk.py                           # Low-level Tello UDP SDK adapter
 └── dji_video_stream.py                    # GStreamer video capture + replay
 ```
@@ -261,7 +306,7 @@ Parameters: `(Kp, Ki, Kd, (min_output, max_output), integral_limit, deadband_pix
 2. `DroneTrackingModule` receives `/video`, publishes `/tracking_overlay`.
 3. For TT agentic blueprint, person follow uses detector-driven tracking with yaw-centering and forward approach.
 4. `cmd_vel` is remapped to `/movecmd_twist` and converted to Tello `rc` commands by `TelloConnectionModule`.
-5. Agent skills call `follow_object`, `center_person_by_yaw`, and `orbit_object`.
+5. Agent skills call `follow_object`, `center_person_by_yaw`, `hover`, `flip`, and `orbit_object`.
 
 ## Available Skills
 
@@ -271,6 +316,8 @@ All skills are exposed to the LLM agent via the `@skill` decorator on `DroneConn
 - `move(x, y, z, duration)` — Move with velocity (m/s)
 - `takeoff(altitude)` — Takeoff to altitude
 - `land()` — Land at current position
+- `hover()` — Cancel active tracking and hover in place without landing
+- `flip(direction)` — Execute a native Tello flip (`forward`, `back`, `left`, `right`)
 - `arm()` / `disarm()` — Arm/disarm motors
 - `set_mode(mode)` — Set flight mode (GUIDED, LOITER, etc.)
 - `fly_to(lat, lon, alt)` — Fly to GPS coordinates

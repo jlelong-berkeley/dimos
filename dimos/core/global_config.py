@@ -30,6 +30,7 @@ def _get_all_numbers(s: str) -> list[float]:
 class GlobalConfig(BaseSettings):
     robot_ip: str | None = None
     robot_ips: str | None = None
+    robot_local_ips: str | None = None
     simulation: bool = False
     replay: bool = False
     replay_dir: str = "go2_sf_office"

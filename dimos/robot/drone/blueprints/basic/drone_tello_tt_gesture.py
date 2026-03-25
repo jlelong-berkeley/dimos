@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 # Copyright 2025-2026 Dimensional Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,18 +14,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DimOS Drone blueprints."""
+"""Gesture-controlled RoboMaster TT / Tello blueprint."""
 
-import lazy_loader as lazy
+from dimos.core.blueprints import autoconnect
+from dimos.robot.drone.blueprints.basic.drone_tello_tt_basic import drone_tello_tt_basic
+from dimos.robot.drone.tello_gesture_control_module import TelloGestureControlModule
 
-__getattr__, __dir__, __all__ = lazy.attach(
-    __name__,
-    submod_attrs={
-        "basic.drone_basic": ["drone_basic"],
-        "basic.drone_tello_tt_basic": ["drone_tello_tt_basic"],
-        "basic.drone_tello_tt_gesture": ["drone_tello_tt_gesture"],
-        "agentic.drone_agentic": ["drone_agentic"],
-        "agentic.drone_tello_tt_fleet_agentic": ["drone_tello_tt_fleet_agentic"],
-        "agentic.drone_tello_tt_agentic": ["drone_tello_tt_agentic"],
-    },
+drone_tello_tt_gesture = autoconnect(
+    drone_tello_tt_basic,
+    TelloGestureControlModule.blueprint(enabled_on_start=True),
 )
+
+__all__ = ["drone_tello_tt_gesture"]

@@ -212,29 +212,43 @@ class FastAPIServer(EdgeIO):
     @staticmethod
     def _decode_audio(raw: bytes) -> tuple[np.ndarray, int]:  # type: ignore[type-arg]
         """Convert the webm/opus blob sent by the browser into mono 16-kHz PCM."""
-        try:
-            # Use ffmpeg to convert to 16-kHz mono 16-bit PCM WAV in memory
-            out, _ = (
-                ffmpeg.input("pipe:0")
-                .output(
-                    "pipe:1",
-                    format="wav",
-                    acodec="pcm_s16le",
-                    ac=1,
-                    ar="16000",
-                    loglevel="quiet",
+        decode_attempts = [
+            ("autodetect", {}),
+            ("webm", {"format": "webm"}),
+            ("ogg", {"format": "ogg"}),
+            ("wav", {"format": "wav"}),
+        ]
+        last_err = "unknown decode error"
+
+        for label, input_kwargs in decode_attempts:
+            try:
+                # Convert to 16-kHz mono 16-bit PCM WAV in memory.
+                out, _ = (
+                    ffmpeg.input("pipe:0", **input_kwargs)
+                    .output(
+                        "pipe:1",
+                        format="wav",
+                        acodec="pcm_s16le",
+                        ac=1,
+                        ar="16000",
+                        loglevel="error",
+                    )
+                    .run(input=raw, capture_stdout=True, capture_stderr=True)
                 )
-                .run(input=raw, capture_stdout=True, capture_stderr=True)
-            )
-            # Load with soundfile (returns float32 by default)
-            audio, sr = sf.read(io.BytesIO(out), dtype="float32")
-            # Ensure 1-D array (mono)
-            if audio.ndim > 1:
-                audio = audio[:, 0]
-            return np.array(audio), sr
-        except Exception as exc:
-            print(f"ffmpeg decoding failed: {exc}")
-            return None, None  # type: ignore[return-value]
+                # Load with soundfile (returns float32 by default)
+                audio, sr = sf.read(io.BytesIO(out), dtype="float32")
+                # Ensure 1-D array (mono)
+                if audio.ndim > 1:
+                    audio = audio[:, 0]
+                return np.array(audio), sr
+            except ffmpeg.Error as exc:
+                stderr = exc.stderr.decode("utf-8", errors="ignore").strip() if exc.stderr else ""
+                last_err = f"{label}: {stderr or exc}"
+            except Exception as exc:
+                last_err = f"{label}: {exc}"
+
+        print(f"ffmpeg decoding failed: {last_err}")
+        return None, None  # type: ignore[return-value]
 
     def setup_routes(self) -> None:
         """Set up FastAPI routes."""

@@ -20,10 +20,15 @@ from typing import Any
 
 from dimos.core.blueprints import autoconnect
 from dimos.core.global_config import global_config
+from dimos.msgs.sensor_msgs import Image
 from dimos.protocol.pubsub.impl.lcmpubsub import LCM
 from dimos.robot.drone.camera_module import DroneCameraModule
 from dimos.robot.drone.tello_connection_module import TelloConnectionModule
 from dimos.web.websocket_vis.websocket_vis_module import websocket_vis
+
+RERUN_IMAGE_MAX_WIDTH = 640
+RERUN_IMAGE_MAX_HEIGHT = 480
+RERUN_IMAGE_INTERVAL_SEC = 0.25
 
 
 def _static_drone_body(rr: Any) -> list[Any]:
@@ -59,9 +64,30 @@ def _drone_rerun_blueprint() -> Any:
     )
 
 
+def _downsample_rerun_image(msg: Image) -> Image:
+    resized, _scale = msg.resize_to_fit(
+        max_width=RERUN_IMAGE_MAX_WIDTH,
+        max_height=RERUN_IMAGE_MAX_HEIGHT,
+    )
+    return resized
+
+
 _rerun_config = {
     "blueprint": _drone_rerun_blueprint,
     "pubsubs": [LCM()],
+    "min_interval_sec": RERUN_IMAGE_INTERVAL_SEC,
+    "visual_override": {
+        # /color_image republishes the same camera frame as /video and doubles
+        # the viewer bandwidth for no extra value in this layout.
+        "world/color_image": None,
+        # Gesture overlay is not displayed in the TT rerun layout; suppress it
+        # to avoid another high-rate full-frame image stream.
+        "world/gesture_overlay": None,
+        # Keep the displayed feeds interactive by reducing per-frame size before
+        # they hit the viewer transport and quotas.
+        "world/video": _downsample_rerun_image,
+        "world/tracking_overlay": _downsample_rerun_image,
+    },
     "static": {
         "world/tf/base_link": _static_drone_body,
     },

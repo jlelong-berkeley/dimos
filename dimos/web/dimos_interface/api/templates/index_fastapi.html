@@ -362,63 +362,132 @@
         // Voice recording functionality
         {% if has_voice %}
         let mediaRecorder;
-        let chunks = [];
+        let micStream;
+        let isVoiceStreaming = false;
+        const VOICE_CHUNK_MS = 3000;
+        let segmentTimer = null;
+        let uploadQueue = Promise.resolve();
         const voiceBtn = document.getElementById('voiceButton');
         const queryResponse = document.getElementById('queryResponse');
 
+        function setVoiceStatus(message, cssClass = 'query-response') {
+            queryResponse.textContent = message;
+            queryResponse.className = cssClass;
+            queryResponse.style.display = 'block';
+        }
+
+        async function uploadVoiceChunk(blob) {
+            if (!blob || blob.size === 0) {
+                return;
+            }
+
+            const formData = new FormData();
+            formData.append('file', blob, 'recording.webm');
+
+            const res = await fetch('/upload_audio', {
+                method: 'POST',
+                body: formData
+            });
+            const json = await res.json();
+            if (!json.success) {
+                throw new Error(json.message || 'Voice upload failed');
+            }
+        }
+
+        function getPreferredMimeType() {
+            const candidates = [
+                'audio/webm;codecs=opus',
+                'audio/webm',
+                'audio/ogg;codecs=opus'
+            ];
+            for (const type of candidates) {
+                if (window.MediaRecorder && MediaRecorder.isTypeSupported(type)) {
+                    return type;
+                }
+            }
+            return '';
+        }
+
+        function clearSegmentTimer() {
+            if (segmentTimer) {
+                clearTimeout(segmentTimer);
+                segmentTimer = null;
+            }
+        }
+
+        async function startSegmentRecorder() {
+            if (!micStream) {
+                micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            }
+
+            const mimeType = getPreferredMimeType();
+            const options = mimeType ? { mimeType } : undefined;
+            const segmentChunks = [];
+            const recorder = options ? new MediaRecorder(micStream, options) : new MediaRecorder(micStream);
+            mediaRecorder = recorder;
+
+            recorder.ondataavailable = (e) => {
+                if (e.data && e.data.size > 0) {
+                    segmentChunks.push(e.data);
+                }
+            };
+
+            recorder.onstop = () => {
+                clearSegmentTimer();
+
+                const blobType = recorder.mimeType || mimeType || 'audio/webm';
+                const blob = new Blob(segmentChunks, { type: blobType });
+
+                uploadQueue = uploadQueue
+                    .then(async () => {
+                        await uploadVoiceChunk(blob);
+                        if (isVoiceStreaming) {
+                            setVoiceStatus('Listening... streaming voice commands');
+                        }
+                    })
+                    .catch((err) => {
+                        setVoiceStatus('Voice upload failed: ' + err.message, 'query-response error');
+                    });
+
+                if (isVoiceStreaming) {
+                    startSegmentRecorder().catch((err) => {
+                        isVoiceStreaming = false;
+                        voiceBtn.classList.remove('recording');
+                        setVoiceStatus('Voice recorder failed: ' + err.message, 'query-response error');
+                    });
+                } else {
+                    setVoiceStatus('Voice streaming stopped.', 'query-response success');
+                }
+            };
+
+            recorder.start();
+            segmentTimer = setTimeout(() => {
+                if (recorder.state === 'recording') {
+                    recorder.stop();
+                }
+            }, VOICE_CHUNK_MS);
+        }
+
         voiceBtn.addEventListener('click', async () => {
-            if (mediaRecorder && mediaRecorder.state === 'recording') {
-                // Stop recording
-                mediaRecorder.stop();
+            if (isVoiceStreaming) {
+                // Stop streaming
+                isVoiceStreaming = false;
                 voiceBtn.classList.remove('recording');
+                clearSegmentTimer();
+                if (mediaRecorder && mediaRecorder.state === 'recording') {
+                    mediaRecorder.stop();
+                } else {
+                    setVoiceStatus('Voice streaming stopped.', 'query-response success');
+                }
             } else {
-                // Start recording
+                // Start continuous recording via short independent segments
                 try {
-                    if (!mediaRecorder) {
-                        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                        mediaRecorder = new MediaRecorder(stream);
-
-                        mediaRecorder.ondataavailable = e => chunks.push(e.data);
-
-                        mediaRecorder.onstop = async () => {
-                            const blob = new Blob(chunks, { type: 'audio/webm' });
-                            chunks = [];
-
-                            // Show uploading status
-                            queryResponse.textContent = 'Processing voice command...';
-                            queryResponse.className = 'query-response';
-                            queryResponse.style.display = 'block';
-
-                            const formData = new FormData();
-                            formData.append('file', blob, 'recording.webm');
-
-                            try {
-                                const res = await fetch('/upload_audio', {
-                                    method: 'POST',
-                                    body: formData
-                                });
-                                const json = await res.json();
-
-                                if (json.success) {
-                                    queryResponse.textContent = 'Voice command received!';
-                                    queryResponse.className = 'query-response success';
-                                    setTimeout(() => {
-                                        queryResponse.style.display = 'none';
-                                    }, 3000);
-                                } else {
-                                    queryResponse.textContent = 'Error: ' + json.message;
-                                    queryResponse.className = 'query-response error';
-                                }
-                            } catch (err) {
-                                queryResponse.textContent = 'Upload failed: ' + err.message;
-                                queryResponse.className = 'query-response error';
-                            }
-                        };
-                    }
-
-                    mediaRecorder.start();
+                    isVoiceStreaming = true;
+                    setVoiceStatus('Listening... streaming voice commands');
+                    await startSegmentRecorder();
                     voiceBtn.classList.add('recording');
                 } catch (err) {
+                    isVoiceStreaming = false;
                     alert('Microphone access denied. Please allow microphone access to use voice commands.');
                 }
             }

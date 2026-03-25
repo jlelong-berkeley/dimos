@@ -58,7 +58,7 @@ YOLO_DEFAULT_IMGSZ = 416
 YOLO_DEFAULT_MAX_DET = 5
 PASSIVE_DETECT_INTERVAL_SEC = 0.3
 YAW_ONLY_DEADBAND_RATIO = 0.028
-YAW_ONLY_PID_KP = 1.0
+YAW_ONLY_PID_KP = 0.9
 YAW_ONLY_PID_KI = 0.1
 YAW_ONLY_PID_KD = 0.62
 YAW_ONLY_MAX_RATE = 0.85
@@ -79,7 +79,10 @@ YAW_ONLY_CROSS_BRAKE_ERR_RATIO = 0.24
 YAW_ONLY_CROSS_BRAKE_SEC = 0.12
 FOLLOW_TARGET_MIN_M = 0.6
 FOLLOW_TARGET_MAX_M = 2.5
-FOLLOW_APPROACH_SPEED = 0.15
+FOLLOW_APPROACH_SPEED = 0.30
+FOLLOW_RANGE_KP = 0.8
+FOLLOW_RANGE_DEADBAND_M = 0.10
+FOLLOW_BACKOFF_SPEED = 0.18
 FOLLOW_ALIGN_SOFT_ERR = 0.15
 FOLLOW_ALIGN_STOP_ERR = 0.30
 FOLLOW_EDGE_MARGIN_RATIO = 0.06
@@ -91,6 +94,7 @@ class DroneTrackingModule(Module):
     # Inputs
     video_input: In[Image]
     follow_object_cmd: In[Any]
+    range_measurement: In[Any]
 
     # Outputs
     tracking_overlay: Out[Image]  # Visualization with bbox and crosshairs
@@ -168,6 +172,9 @@ class DroneTrackingModule(Module):
         )
         self._current_object: str | None = None
         self._latest_frame: Image | None = None
+        self._latest_range_measurement: dict[str, Any] | None = None
+        self._latest_range_m: float | None = None
+        self._range_lock = threading.Lock()
         self._frame_lock = threading.Lock()
         self._yolo: Any | None = None
         self._yolo_device = "cpu"
@@ -193,14 +200,52 @@ class DroneTrackingModule(Module):
         with self._frame_lock:
             self._latest_frame = frame
 
+    def _publish_overlay_image(self, frame: NDArray[np.uint8]) -> None:  # type: ignore[type-arg]
+        """Publish an overlay frame to local subscribers and transports."""
+        self.tracking_overlay.publish(Image.from_numpy(frame, format=ImageFormat.BGR))
+
+    def _publish_cmd_vel(self, vx: float, vy: float, yaw_rate: float) -> None:
+        """Publish velocity commands to local subscribers and transports."""
+        twist = Twist()
+        twist.linear = Vector3(vx, vy, 0)
+        twist.angular = Vector3(0, 0, yaw_rate)
+        self.cmd_vel.publish(twist)
+
     def _on_follow_object_cmd(self, cmd: String) -> None:
         msg = json.loads(cmd.data)
+        command = str(msg.get("command", "track")).strip().lower()
+        if command in {"stop", "hover"}:
+            self._stop_tracking()
+            return
         self.track_object(
             object_name=msg.get("object_description"),
             duration=float(msg.get("duration", 120.0)),
             distance_m=float(msg.get("distance_m", 1.0)),
             control_mode=str(msg.get("control_mode", "full")),
         )
+
+    def update_range_measurement(self, measurement: Any) -> None:
+        """Update the latest distance measurement used by follow control."""
+        payload: dict[str, Any] | None = None
+        if isinstance(measurement, String):
+            try:
+                payload = json.loads(measurement.data)
+            except json.JSONDecodeError:
+                payload = None
+        elif isinstance(measurement, dict):
+            payload = measurement
+
+        if payload is None:
+            return
+
+        raw_distance = payload.get("ext_tof_m")
+        distance_m = None
+        if isinstance(raw_distance, (float, int)):
+            distance_m = float(raw_distance)
+
+        with self._range_lock:
+            self._latest_range_measurement = dict(payload)
+            self._latest_range_m = distance_m
 
     def _create_tracker(self) -> Any | None:
         """Create the best available OpenCV tracker for this environment."""
@@ -335,6 +380,8 @@ class DroneTrackingModule(Module):
 
         if self.follow_object_cmd.transport:
             self.follow_object_cmd.subscribe(self._on_follow_object_cmd)
+        if self.range_measurement.transport:
+            self.range_measurement.subscribe(self.update_range_measurement)
 
         if self._enable_passive_overlay:
             self._start_passive_overlay_loop()
@@ -375,7 +422,8 @@ class DroneTrackingModule(Module):
         Args:
             object_name: Name of object to track, or None for most prominent
             duration: Maximum tracking duration in seconds
-            distance_m: Reserved follow-distance hint (person follow currently uses fixed approach speed)
+            distance_m: Desired follow distance in meters. Uses TT extension TOF
+                when a valid reading is available.
             control_mode: "full" (translate/strafe) or "yaw_only" (rotate in place)
 
         Returns:
@@ -405,11 +453,8 @@ class DroneTrackingModule(Module):
             if bbox is None:
                 msg = f"No object detected{' for: ' + object_name if object_name else ''}"
                 logger.warning(msg)
-                if self.tracking_overlay.transport:
-                    overlay = self._draw_search_overlay(
-                        frame, f"Searching for {object_name or 'object'} (not found)"
-                    )
-                    self.tracking_overlay.publish(Image.from_numpy(overlay, format=ImageFormat.BGR))
+                overlay = self._draw_search_overlay(frame, f"Searching for {object_name or 'object'} (not found)")
+                self._publish_overlay_image(overlay)
                 self._publish_status({"status": "not_found", "object": self._current_object})
                 return msg
 
@@ -959,8 +1004,7 @@ class DroneTrackingModule(Module):
                     "Passive detect: no person",
                 )
 
-            if self.tracking_overlay.transport:
-                self.tracking_overlay.publish(Image.from_numpy(overlay, format=ImageFormat.BGR))
+            self._publish_overlay_image(overlay)
 
             time.sleep(PASSIVE_DETECT_INTERVAL_SEC)
 
@@ -1056,12 +1100,22 @@ class DroneTrackingModule(Module):
         frame_width: int,
         _frame_height: int,
         current_x: float,
+        measured_distance_m: float | None = None,
     ) -> tuple[float, float, float, float]:
         yaw_rate = self._compute_yaw_rate(current_x, frame_width / 2.0)
         norm_yaw_error = abs((current_x - (frame_width / 2.0)) / max(frame_width / 2.0, 1.0))
 
         x1, _y1, x2, _y2 = bbox
         vx = FOLLOW_APPROACH_SPEED
+        if measured_distance_m is not None:
+            range_error = measured_distance_m - self._target_distance_m
+            if abs(range_error) <= FOLLOW_RANGE_DEADBAND_M:
+                vx = 0.0
+            else:
+                vx = max(
+                    -FOLLOW_BACKOFF_SPEED,
+                    min(FOLLOW_APPROACH_SPEED, FOLLOW_RANGE_KP * range_error),
+                )
 
         if norm_yaw_error >= FOLLOW_ALIGN_STOP_ERR:
             vx = 0.0
@@ -1077,6 +1131,10 @@ class DroneTrackingModule(Module):
             vx = 0.0
 
         return float(vx), 0.0, 0.0, float(yaw_rate)
+
+    def _get_latest_range_m(self) -> float | None:
+        with self._range_lock:
+            return self._latest_range_m
 
     def _visual_servoing_loop(self, tracker: Any, duration: float) -> None:
         """Main visual servoing control loop.
@@ -1159,20 +1217,12 @@ class DroneTrackingModule(Module):
                     if self._max_lateral_velocity is not None:
                         vy = max(-self._max_lateral_velocity, min(self._max_lateral_velocity, vy))
 
-                # Publish velocity command via LCM
-                if self.cmd_vel.transport:
-                    twist = Twist()
-                    twist.linear = Vector3(vx, vy, 0)
-                    twist.angular = Vector3(0, 0, yaw_rate)
-                    self.cmd_vel.publish(twist)
+                self._publish_cmd_vel(vx, vy, yaw_rate)
 
-                # Publish visualization if transport is set
-                if self.tracking_overlay.transport:
-                    overlay = self._draw_tracking_overlay(
-                        frame, (int(x), int(y), int(w), int(h)), (int(current_x), int(current_y))
-                    )
-                    overlay_msg = Image.from_numpy(overlay, format=ImageFormat.BGR)
-                    self.tracking_overlay.publish(overlay_msg)
+                overlay = self._draw_tracking_overlay(
+                    frame, (int(x), int(y), int(w), int(h)), (int(current_x), int(current_y))
+                )
+                self._publish_overlay_image(overlay)
 
                 # Publish status
                 self._publish_status(
@@ -1195,12 +1245,7 @@ class DroneTrackingModule(Module):
         except Exception as e:
             logger.error(f"Error in servoing loop: {e}")
         finally:
-            # Stop movement by publishing zero velocity
-            if self.cmd_vel.transport:
-                stop_twist = Twist()
-                stop_twist.linear = Vector3(0, 0, 0)
-                stop_twist.angular = Vector3(0, 0, 0)
-                self.cmd_vel.publish(stop_twist)
+            self._publish_cmd_vel(0.0, 0.0, 0.0)
             self._tracking_active = False
             logger.info(f"Visual servoing loop ended after {frame_count} frames")
 
@@ -1248,11 +1293,11 @@ class DroneTrackingModule(Module):
                         self._person_lock_bbox = None
                     if lost_track_count % 10 == 0:
                         logger.warning(f"Detector loop has no target (count: {lost_track_count})")
-                    if self.tracking_overlay.transport and lost_track_count % 5 == 0:
+                    if lost_track_count % 5 == 0:
                         overlay = self._draw_search_overlay(
                             detect_frame, f"Searching for {object_name or 'object'}"
                         )
-                        self.tracking_overlay.publish(Image.from_numpy(overlay, format=ImageFormat.BGR))
+                        self._publish_overlay_image(overlay)
                     if lost_track_count >= max_lost_frames:
                         self._publish_status(
                             {"status": "lost", "object": self._current_object, "frame": frame_count}
@@ -1276,29 +1321,24 @@ class DroneTrackingModule(Module):
                     last_candidate_bbox = bbox_xyxy
 
                     if confirm_hits < PERSON_CONFIRM_FRAMES:
-                        if self.cmd_vel.transport:
-                            hold_twist = Twist()
-                            hold_twist.linear = Vector3(0, 0, 0)
-                            hold_twist.angular = Vector3(0, 0, 0)
-                            self.cmd_vel.publish(hold_twist)
-                        if self.tracking_overlay.transport:
-                            cx = int((bbox_xyxy[0] + bbox_xyxy[2]) / 2)
-                            cy = int((bbox_xyxy[1] + bbox_xyxy[3]) / 2)
-                            overlay = self._draw_tracking_overlay(
-                                detect_frame,
-                                (
-                                    int(bbox_xyxy[0]),
-                                    int(bbox_xyxy[1]),
-                                    int(max(1, bbox_xyxy[2] - bbox_xyxy[0])),
-                                    int(max(1, bbox_xyxy[3] - bbox_xyxy[1])),
-                                ),
-                                (cx, cy),
-                            )
-                            overlay = self._draw_search_overlay(
-                                overlay,
-                                f"Candidate person {confirm_hits}/{PERSON_CONFIRM_FRAMES}",
-                            )
-                            self.tracking_overlay.publish(Image.from_numpy(overlay, format=ImageFormat.BGR))
+                        self._publish_cmd_vel(0.0, 0.0, 0.0)
+                        cx = int((bbox_xyxy[0] + bbox_xyxy[2]) / 2)
+                        cy = int((bbox_xyxy[1] + bbox_xyxy[3]) / 2)
+                        overlay = self._draw_tracking_overlay(
+                            detect_frame,
+                            (
+                                int(bbox_xyxy[0]),
+                                int(bbox_xyxy[1]),
+                                int(max(1, bbox_xyxy[2] - bbox_xyxy[0])),
+                                int(max(1, bbox_xyxy[3] - bbox_xyxy[1])),
+                            ),
+                            (cx, cy),
+                        )
+                        overlay = self._draw_search_overlay(
+                            overlay,
+                            f"Candidate person {confirm_hits}/{PERSON_CONFIRM_FRAMES}",
+                        )
+                        self._publish_overlay_image(overlay)
                         time.sleep(0.05)
                         continue
 
@@ -1326,11 +1366,13 @@ class DroneTrackingModule(Module):
                     self._target_distance_m = max(
                         FOLLOW_TARGET_MIN_M, min(FOLLOW_TARGET_MAX_M, distance_m)
                     )
+                    measured_distance_m = self._get_latest_range_m()
                     vx, vy, vz, yaw_rate = self._compute_person_follow_command(
                         (x, y, x + w, y + h),
                         frame_width,
                         frame_height,
                         current_x,
+                        measured_distance_m=measured_distance_m,
                     )
                 else:
                     vx, vy, vz = self.servoing_controller.compute_velocity_control(
@@ -1351,18 +1393,12 @@ class DroneTrackingModule(Module):
                     if self._max_lateral_velocity is not None:
                         vy = max(-self._max_lateral_velocity, min(self._max_lateral_velocity, vy))
 
-                if self.cmd_vel.transport:
-                    twist = Twist()
-                    twist.linear = Vector3(vx, vy, 0)
-                    twist.angular = Vector3(0, 0, yaw_rate)
-                    self.cmd_vel.publish(twist)
+                self._publish_cmd_vel(vx, vy, yaw_rate)
 
-                if self.tracking_overlay.transport:
-                    overlay = self._draw_tracking_overlay(
-                        detect_frame, (x, y, w, h), (int(current_x), int(current_y))
-                    )
-                    overlay_msg = Image.from_numpy(overlay, format=ImageFormat.BGR)
-                    self.tracking_overlay.publish(overlay_msg)
+                overlay = self._draw_tracking_overlay(
+                    detect_frame, (x, y, w, h), (int(current_x), int(current_y))
+                )
+                self._publish_overlay_image(overlay)
 
                 self._publish_status(
                     {
@@ -1376,6 +1412,7 @@ class DroneTrackingModule(Module):
                         "yaw_rate": float(yaw_rate),
                         "mode": self._control_mode,
                         "distance_target_m": float(self._target_distance_m),
+                        "distance_measured_m": self._get_latest_range_m(),
                         "bbox_height_ratio": float(bbox_height_ratio),
                         "frame": frame_count,
                     }
@@ -1386,11 +1423,7 @@ class DroneTrackingModule(Module):
         except Exception as e:
             logger.error(f"Error in detection fallback loop: {e}")
         finally:
-            if self.cmd_vel.transport:
-                stop_twist = Twist()
-                stop_twist.linear = Vector3(0, 0, 0)
-                stop_twist.angular = Vector3(0, 0, 0)
-                self.cmd_vel.publish(stop_twist)
+            self._publish_cmd_vel(0.0, 0.0, 0.0)
             self._tracking_active = False
             logger.info(f"Detector loop ended after {frame_count} frames")
 
@@ -1468,22 +1501,22 @@ class DroneTrackingModule(Module):
         Args:
             status: Status dictionary
         """
-        if self.tracking_status.transport:
-            status_msg = String(json.dumps(status))
-            self.tracking_status.publish(status_msg)
+        status_msg = String(json.dumps(status))
+        self.tracking_status.publish(status_msg)
 
     def _stop_tracking(self) -> None:
         """Stop tracking and clean up."""
         self._tracking_active = False
-        if self._tracking_thread and self._tracking_thread.is_alive():
-            self._tracking_thread.join(timeout=1)
+        tracking_thread = self._tracking_thread
+        self._tracking_thread = None
+        if (
+            tracking_thread
+            and tracking_thread.is_alive()
+            and tracking_thread is not threading.current_thread()
+        ):
+            tracking_thread.join(timeout=1)
 
-        # Send stop command via LCM
-        if self.cmd_vel.transport:
-            stop_twist = Twist()
-            stop_twist.linear = Vector3(0, 0, 0)
-            stop_twist.angular = Vector3(0, 0, 0)
-            self.cmd_vel.publish(stop_twist)
+        self._publish_cmd_vel(0.0, 0.0, 0.0)
 
         self._publish_status({"status": "stopped", "object": self._current_object})
 

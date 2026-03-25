@@ -119,6 +119,16 @@ class TestBridgeSpawnLogic:
             "Users without dimos-viewer will crash."
         )
 
+    def test_bridge_connects_to_spawned_custom_viewer(self):
+        """When dimos-viewer is spawned successfully, bridge should connect to it directly."""
+        from dimos.visualization.rerun.bridge import RerunBridgeModule
+
+        src = inspect.getsource(RerunBridgeModule.start)
+        assert "rr.connect_grpc" in src, (
+            "bridge.py start() no longer connects directly to the spawned custom viewer. "
+            "This can re-trigger viewer auto-spawn/version mismatch warnings."
+        )
+
 
 def _parse_version(version_str: str) -> tuple[int, int]:
     """Extract (major, minor) from a version string like '0.29.2' or '0.30.0a2'."""

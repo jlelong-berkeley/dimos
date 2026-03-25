@@ -23,12 +23,16 @@ Video/state
 
 - `drone-tello-tt-basic`
 - `drone-tello-tt-agentic`
+- `drone-tello-tt-fleet-agentic`
+- `drone-tello-tt-gesture`
 
 List and run:
 
 ```bash
 dimos list
-dimos run --robot-ip 192.168.10.1 drone-tello-tt-agentic  --disable web-input
+dimos --robot-ip 192.168.10.1 run drone-tello-tt-agentic --disable web-input
+dimos --robot-ips 192.168.1.9,192.168.1.10 run drone-tello-tt-fleet-agentic
+dimos --robot-ip 192.168.10.1 run drone-tello-tt-gesture
 ```
 
 ## Hardware + Network Connection Steps
@@ -51,6 +55,43 @@ For reliable Tello control plus cloud API access (OpenAI, optional Qwen, etc.), 
 
 If you only have a single Wi-Fi radio, connecting to Tello usually removes internet access and cloud tool-calls will fail.
 
+## Multi-Drone Fleet Mode
+
+`drone-tello-tt-fleet-agentic` is the segmented multi-drone mode.
+
+See [RoboMaster TT / Tello Fleet](/docs/usage/drone_tello_tt_fleet.md) for the full operator guide covering startup, IP discovery, viewer output, web UI, and available fleet commands.
+
+- It supports one or many Tellos behind a single agent.
+- Each drone is exposed as `drone-1`, `drone-2`, and so on, and can also be addressed by IP.
+- The fleet web UI serves separate video feeds for every configured drone on `http://localhost:5555`.
+- The agent can issue targeted actions such as `takeoff_drone(drone="drone-1")`.
+- For "drone 1 do X while drone 2 does Y" requests, use `dispatch_segmented_plan(plan_json=...)` so each drone sequence runs in parallel.
+
+Network requirement:
+
+- Multi-drone mode works with one laptop IP.
+- DimOS assigns a unique local command/state/video port set to each drone and uses the Tello SDK `port` command so telemetry and video remain separated per drone.
+- `--robot-local-ips` is now optional. Use it only if you want to force a specific local bind IP or interface.
+
+Example:
+
+```bash
+dimos \
+  --robot-ips 192.168.1.9,192.168.1.10 \
+  run \
+  drone-tello-tt-fleet-agentic
+```
+
+Optional interface pinning:
+
+```bash
+dimos \
+  --robot-ips 192.168.1.9,192.168.1.10 \
+  --robot-local-ips 192.168.1.7 \
+  run \
+  drone-tello-tt-fleet-agentic
+```
+
 ## New Modules
 
 - `dimos.robot.drone.tello_sdk.TelloSdkClient`
@@ -58,8 +99,57 @@ If you only have a single Wi-Fi radio, connecting to Tello usually removes inter
   - State stream (`8890`)
   - Video stream (`11111`) decode + reconnect handling
 - `dimos.robot.drone.tello_connection_module.TelloConnectionModule`
-  - Skills: `takeoff`, `land`, `move`, `move_relative`, `yaw`, `rc`, `send_ext`, `follow_object`, `center_person_by_yaw`, `orbit_object`, `observe`
+  - Skills: `takeoff`, `land`, `hover`, `move`, `move_relative`, `yaw`, `flip`, `rc`, `send_ext`, `follow_object`, `center_person_by_yaw`, `orbit_object`, `observe`
   - Publishes telemetry/status/odom/video and follow-command stream
+- `dimos.robot.drone.tello_fleet_module.TelloFleetModule`
+  - Multi-drone Tello SDK manager with per-drone skills, segmented-plan dispatch, and integrated multi-stream web UI
+- `dimos.robot.drone.tello_gesture_control_module.TelloGestureControlModule`
+  - Adapts `droneWork/tello-gesture-control` into a DimOS module
+  - Reads the live Tello camera stream, publishes overlay/status, and issues manual override RC commands
+  - Adds gesture-debounced `Forward`, `Back`, `Left`, `Right`, `Up`, `Down`, `Stop`, `Land`, plus dynamic clockwise / counter-clockwise yaw gestures
+
+## Gesture Control Blueprint
+
+`drone-tello-tt-gesture` composes on top of `drone-tello-tt-basic` and enables hand-gesture control by default.
+
+Install the runtime dependencies first:
+
+```bash
+uv pip install mediapipe tensorflow
+# or: uv pip install mediapipe tflite-runtime
+```
+
+Run it:
+
+```bash
+dimos --robot-ip 192.168.10.1 run drone-tello-tt-gesture
+```
+
+Gesture behavior:
+
+- Hold a gesture steadily for roughly half a second to trigger it.
+- `Up` takes off when grounded, and becomes an upward motion command once airborne.
+- `Land` sends a zero-RC command and then lands immediately.
+- Dynamic clockwise / counter-clockwise finger motions map to yaw commands.
+- The recognized hand skeleton and resolved action are rendered to the existing `tracking_overlay` view.
+
+## Gesture Control In `drone-tello-tt-agentic`
+
+`drone-tello-tt-agentic` now also includes the gesture-control module, but it starts disabled.
+
+Use natural language with the agent:
+
+```text
+enable gesture control
+disable gesture control
+```
+
+Behavior in the agentic blueprint:
+
+- The agent calls `enable_gesture_control()` only when you explicitly ask for it.
+- Once enabled, the live Tello camera feed is used for gesture recognition and manual override RC commands.
+- When disabled, the gesture module keeps its status path alive but does not command the drone.
+- This keeps normal agent / tracking behavior intact until you opt into gestures.
 
 ## Tracking and Follow Behavior
 
@@ -82,6 +172,22 @@ Tello blueprint opt-in:
 - `person_follow_policy="yaw_forward_constant"`
 
 This keeps Tello-specific behavior scoped to Tello blueprints.
+
+### Hover Override
+
+`hover()` is the Tello-side stop override for visual tracking.
+
+- It publishes a stop command to `DroneTrackingModule`, so `follow_object()` and `center_person_by_yaw()` stop issuing new `cmd_vel` updates.
+- It then sends zero-RC plus the native SDK `stop` command, which maps to hover in place.
+- Use this when you want the drone to hold position and be ready for the next skill without landing.
+
+### Flip Skill
+
+`flip(direction)` exposes the native Tello SDK flip command.
+
+- Supported directions: `forward`, `back`, `left`, `right`
+- Single-letter aliases also work: `f`, `b`, `l`, `r`
+- The drone must already be airborne and have enough free space around it
 
 ## Optional Local Detector/GPU Settings
 
@@ -106,8 +212,13 @@ Notes:
 
 - `dimos/robot/drone/tello_sdk.py`
 - `dimos/robot/drone/tello_connection_module.py`
+- `dimos/robot/drone/tello_fleet_config.py`
+- `dimos/robot/drone/tello_fleet_module.py`
+- `dimos/robot/drone/tello_gesture_control_module.py`
+- `dimos/robot/drone/blueprints/basic/drone_tello_tt_gesture.py`
 - `dimos/robot/drone/blueprints/basic/drone_tello_tt_basic.py`
 - `dimos/robot/drone/blueprints/agentic/drone_tello_tt_agentic.py`
+- `dimos/robot/drone/blueprints/agentic/drone_tello_tt_fleet_agentic.py`
 
 ## Files Updated
 
@@ -121,6 +232,7 @@ Notes:
 - `dimos/robot/drone/blueprints/agentic/__init__.py`
 - `dimos/robot/all_blueprints.py`
 - `dimos/robot/drone/README.md`
+- `pyproject.toml`
 
 ## Non-Regression Intent
 
@@ -133,4 +245,9 @@ uv run ruff check dimos/robot/drone/
 uv run mypy dimos/robot/drone/
 python3 -m py_compile dimos/robot/drone/drone_tracking_module.py
 python3 -m py_compile dimos/robot/drone/tello_connection_module.py
+python3 -m py_compile dimos/robot/drone/tello_fleet_module.py
+python3 -m py_compile dimos/robot/drone/tello_gesture_control_module.py
+uv run pytest dimos/robot/drone/test_tello_connection_module.py -v
+uv run pytest dimos/robot/drone/test_tello_fleet_module.py -v
+uv run pytest dimos/robot/drone/test_tello_gesture_control_module.py -v
 ```

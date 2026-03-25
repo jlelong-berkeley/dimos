@@ -21,14 +21,20 @@ from dimos.agents.web_human_input import web_input
 from dimos.core.blueprints import autoconnect
 from dimos.robot.drone.blueprints.basic.drone_tello_tt_basic import drone_tello_tt_basic
 from dimos.robot.drone.drone_tracking_module import DroneTrackingModule
+from dimos.robot.drone.tello_gesture_control_module import TelloGestureControlModule
 
 TELLO_TT_SYSTEM_PROMPT = """\
 You are controlling a RoboMaster TT (Tello Talent) drone over the Tello SDK.
 Use short, safe movement commands and keep altitude conservative indoors.
-Prefer follow_object, orbit_object, move, move_relative, yaw, takeoff, and land.
+Prefer hover, follow_object, orbit_object, move, move_relative, yaw, flip, takeoff, and land.
+Gesture control is available but starts disabled.
+If the user explicitly asks to enable gesture control, call enable_gesture_control().
+If the user explicitly asks to disable gesture control, call disable_gesture_control().
+Do not enable gesture control unless the user directly asks for it.
 For "scan/find person then follow", call follow_object(object_description="person", distance_m=1.0).
 For any "hover + rotate/center person in frame" request, ALWAYS call
 center_person_by_yaw(duration=..., scan_step_deg=0.0, max_scan_steps=1).
+If the user asks to stop, cancel following, or hover in place, call hover().
 Do NOT call follow_object in default mode for rotate-only requests.
 For "circle around person", call orbit_object(radius_m=1.0, revolutions=1.0).
 Always end with land() when user asks to land.
@@ -45,12 +51,14 @@ drone_tello_tt_agentic = autoconnect(
         force_detection_servoing_for_person=True,
         person_follow_policy="yaw_forward_constant",
     ),
+    TelloGestureControlModule.blueprint(enabled_on_start=False),
     agent(system_prompt=TELLO_TT_SYSTEM_PROMPT, model="gpt-4o"),
     web_input(),
 ).remappings(
     [
         (DroneTrackingModule, "video_input", "video"),
         (DroneTrackingModule, "cmd_vel", "movecmd_twist"),
+        (TelloGestureControlModule, "tracking_overlay", "gesture_overlay"),
     ]
 )
 
