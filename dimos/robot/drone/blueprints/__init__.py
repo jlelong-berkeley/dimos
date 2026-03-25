@@ -21,6 +21,8 @@ __getattr__, __dir__, __all__ = lazy.attach(
     __name__,
     submod_attrs={
         "basic.drone_basic": ["drone_basic"],
+        "basic.drone_tello_tt_basic": ["drone_tello_tt_basic"],
         "agentic.drone_agentic": ["drone_agentic"],
+        "agentic.drone_tello_tt_agentic": ["drone_tello_tt_agentic"],
     },
 )

@@ -22,5 +22,7 @@ __getattr__, __dir__, __all__ = lazy.attach(
         "camera_module": ["DroneCameraModule"],
         "connection_module": ["DroneConnectionModule"],
         "mavlink_connection": ["MavlinkConnection"],
+        "tello_connection_module": ["TelloConnectionModule"],
+        "tello_sdk": ["TelloSdkClient"],
     },
 )
