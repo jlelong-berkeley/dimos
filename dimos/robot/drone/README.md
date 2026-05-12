@@ -25,6 +25,12 @@ dimos --robot-ip 192.168.10.1 run drone-tello-tt-basic
 dimos --robot-ip 192.168.10.1 run drone-tello-tt-agentic --disable web-input
 dimos --robot-ips 192.168.1.9,192.168.1.10 run drone-tello-tt-fleet-agentic
 dimos --robot-ip 192.168.10.1 run drone-tello-tt-gesture
+
+# PX4 X500 swarm in Gazebo SITL
+source .venv/bin/activate
+python -m dimos.robot.drone.px4_sitl_launcher --px4-dir droneWork/PX4-Autopilot
+dimos run drone-px4-swarm-sitl
+dimos run drone-px4-swarm-agentic
 ```
 
 To interact with the agent, run `dimos humancli` in a separate terminal.
@@ -111,6 +117,59 @@ Use this mode when you want commands such as "drone 1 take off and move left whi
 Multi-drone mode works with one laptop IP. DimOS assigns a unique local command/state/video port set to each drone and uses the Tello SDK `port` command so video and telemetry stay separated.
 
 `--robot-local-ips` is optional and can be used to pin all drones to one specific local interface/IP, for example `--robot-local-ips 192.168.1.7`.
+
+### `drone-px4-swarm-sitl`
+Three PX4 `gz_x500` drones in Gazebo, commanded from DimOS over MAVLink. Takeoff, landing, arming, and RTL use native PX4 commands; swarm motion uses PX4 Offboard position setpoints with velocity feed-forward from the swarm behavior law.
+
+Start PX4/Gazebo in one terminal:
+
+```bash
+source .venv/bin/activate
+python -m dimos.robot.drone.px4_sitl_launcher --px4-dir droneWork/PX4-Autopilot
+```
+
+Then connect DimOS in another terminal:
+
+```bash
+dimos run drone-px4-swarm-sitl
+```
+
+The launcher starts `x500_0`, `x500_1`, and `x500_2` in a line at 6 m spacing and leaves them visible in Gazebo/QGC. The default Gazebo world includes a ground grid and leaves the camera in free-look mode; add `--follow-camera` if you want Gazebo to track the middle vehicle. The DimOS module connects to `udpin:127.0.0.1:14540`, `14541`, and `14542`.
+
+| Skill | Purpose |
+|--------|---------|
+| `takeoff_swarm` | Arm all drones, use PX4 native takeoff until airborne, enter PX4 Offboard, then keep an Offboard hold stream active |
+| `hover_swarm` | Hold current airborne positions; `duration <= 0` keeps holding until another swarm command |
+| `move_swarm_relative` | Move the whole swarm by an ENU offset while preserving the current formation, or pass `spacing` to set adjacent line spacing |
+| `go_to_shared_point` | Move all drones to a formation around one ENU point |
+| `go_to_points` | Move drones to explicit per-drone ENU points; a single point is treated as a shared formation center |
+| `sweep_grid` | Assign non-overlapping lawnmower lanes and execute them through Offboard setpoints |
+| `investigate_relative` / `task_two_units_to_investigate_relative` | Send closest units to a point relative to the current swarm center |
+| `investigate_coordinate` / `task_two_units_to_investigate_coordinate` | Send closest units to an absolute ENU point while other units hold position and still contribute spacing |
+| `count_units_within_radius_of_drone` | Report proximity counts and drone names |
+| `return_to_line_formation` | Move all drones to a line formation |
+| `return_to_launch` | Swarm-aware return above launch positions, then optional land |
+| `px4_native_rtl` | Direct PX4 RTL fallback, bypassing the swarm velocity layer |
+| `get_fleet_state` / `list_drones` | Report positions, modes, battery placeholders, and pairwise distances |
+
+The optimized Project3 behavior is ported into `px4_swarm_behavior.py` and used as the base velocity feed-forward allocator: goal attraction to assigned points plus inter-drone repulsion. DimOS does not import the GA training package at runtime; it uses the fitted design vector copied from `droneWork/Project3/StudentCode/px4_swarm_ga`. Static obstacle avoidance is intentionally not part of this layer.
+
+Control flow for motion skills is:
+
+```text
+skill target planner
+  -> desired shared-ENU target points
+  -> Project3 swarm behavior velocity feed-forward
+  -> MAVLink SET_POSITION_TARGET_LOCAL_NED position + velocity setpoint
+  -> PX4 internal position controller
+```
+
+This is not a DimOS-side PID controller. PX4 handles the low-level position/attitude control and state estimation. DimOS consumes PX4 `LOCAL_POSITION_NED` telemetry, converts each vehicle into a configured shared ENU frame, computes spacing-aware targets and feed-forward velocities, and continuously streams setpoints. While airborne, motion skills leave a background hold active so PX4 does not trigger Offboard-loss landing between agent commands. `get_fleet_state` reports `velocity_ready` and `hold_active` in the final `control:` line.
+
+### `drone-px4-swarm-agentic`
+Composes the PX4 swarm module with an agent prompt aware of the swarm skills. Use this when you want natural-language commands such as "take your team and sweep this grid" or "task two units to investigate this coordinate."
+
+For hardware, keep the same DimOS module but pass real MAVLink connection strings and leave `configure_sitl_failsafes=False`. The current module assumes a shared ENU frame; real multi-drone RTK integration should supply consistent per-drone origins or extend the telemetry layer to convert GPS/RTK fixes into a common ENU frame before velocity allocation.
 
 ### `drone-tello-tt-gesture`
 Composes on top of `drone-tello-tt-basic`, adding:
