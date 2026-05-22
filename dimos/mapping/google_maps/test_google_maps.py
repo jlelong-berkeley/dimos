@@ -13,6 +13,8 @@
 # limitations under the License.
 
 
+from googlemaps.exceptions import ApiError
+
 from dimos.mapping.types import LatLon
 
 
@@ -23,6 +25,41 @@ def test_get_position(maps_client, maps_fixture) -> None:
 
     assert res.model_dump() == {
         "description": "Golden Gate Bridge, Golden Gate Brg, San Francisco, CA, USA",
+        "lat": 37.8199109,
+        "lon": -122.4785598,
+    }
+
+
+def test_get_position_falls_back_to_places(maps_client, maps_fixture) -> None:
+    maps_client._client.geocode.return_value = []
+    maps_client._client.places.return_value = maps_fixture("get_position_with_places.json")
+
+    res = maps_client.get_position(
+        "golden gate bridge",
+        current_location=LatLon(lat=37.78017758753598, lon=-122.4144951709186),
+    )
+
+    assert res.model_dump() == {
+        "description": "Golden Gate Bridge, Golden Gate Brg, San Francisco, CA, United States",
+        "lat": 37.8199109,
+        "lon": -122.4785598,
+    }
+    maps_client._client.places.assert_called_once()
+
+
+def test_get_position_falls_back_to_places_after_geocode_error(maps_client, maps_fixture) -> None:
+    maps_client._client.geocode.side_effect = ApiError(
+        "REQUEST_DENIED", "Geocoding API has not been used in project"
+    )
+    maps_client._client.places.return_value = maps_fixture("get_position_with_places.json")
+
+    res = maps_client.get_position(
+        "golden gate bridge",
+        current_location=LatLon(lat=37.78017758753598, lon=-122.4144951709186),
+    )
+
+    assert res.model_dump() == {
+        "description": "Golden Gate Bridge, Golden Gate Brg, San Francisco, CA, United States",
         "lat": 37.8199109,
         "lon": -122.4785598,
     }

@@ -73,7 +73,9 @@ class SwarmBehaviorWeights:
     z_gain: float
 
     @classmethod
-    def from_design_vector(cls, values: list[float] | tuple[float, ...] | np.ndarray[Any, Any]) -> SwarmBehaviorWeights:
+    def from_design_vector(
+        cls, values: list[float] | tuple[float, ...] | np.ndarray[Any, Any]
+    ) -> SwarmBehaviorWeights:
         """Create behavior weights from a Project3-style design vector."""
         vector = np.asarray(values, dtype=float)
         if len(vector) != len(DESIGN_VARIABLES):
@@ -158,6 +160,28 @@ class SwarmBehaviorLaw:
         command[:, 2] = np.clip(command[:, 2], -self.max_vertical_speed, self.max_vertical_speed)
         return command
 
+    def separation_velocity_commands(
+        self,
+        positions_enu: np.ndarray[Any, Any],
+        active_mask: np.ndarray[Any, Any] | None = None,
+    ) -> np.ndarray[Any, Any]:
+        """Compute the weighted drone-drone repulsion velocity field."""
+        positions = np.asarray(positions_enu, dtype=float)
+        if positions.ndim != 2 or positions.shape[1] != 3:
+            raise ValueError("positions_enu must have shape (N, 3)")
+
+        n_drones = positions.shape[0]
+        if active_mask is None:
+            active = np.ones(n_drones, dtype=bool)
+        else:
+            active = np.asarray(active_mask, dtype=bool)
+
+        command = self.weights.W_sep * self._separation_repulsion(positions, active)
+        command[~active] = 0.0
+        command = self._clip_speed(command, self.weights.v_max)
+        command[:, 2] = np.clip(command[:, 2], -self.max_vertical_speed, self.max_vertical_speed)
+        return command
+
     def _goal_attraction(
         self,
         positions: np.ndarray[Any, Any],
@@ -191,10 +215,9 @@ class SwarmBehaviorLaw:
                 if distance <= 1.0e-9:
                     continue
                 direction = away / distance
-                exponential = (
-                    self.weights.w_sep_near * np.exp(-self.weights.c_sep_near * distance)
-                    + self.weights.w_sep_far * np.exp(-self.weights.c_sep_far * distance)
-                )
+                exponential = self.weights.w_sep_near * np.exp(
+                    -self.weights.c_sep_near * distance
+                ) + self.weights.w_sep_far * np.exp(-self.weights.c_sep_far * distance)
                 safety_scale = (self.min_separation / max(distance, 1.0e-3)) ** 2
                 repulsion[i] += exponential * safety_scale * direction
         return repulsion

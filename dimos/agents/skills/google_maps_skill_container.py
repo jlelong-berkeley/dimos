@@ -25,6 +25,21 @@ from dimos.utils.logging_config import setup_logger
 
 logger = setup_logger()
 
+try:
+    from googlemaps.exceptions import ApiError, TransportError
+except ImportError:  # pragma: no cover
+    ApiError = TransportError = Exception  # type: ignore[misc,assignment]
+
+
+def _google_maps_error_message(exc: Exception) -> str:
+    if isinstance(exc, ApiError):
+        status = getattr(exc, "status", "")
+        message = getattr(exc, "message", "") or str(exc)
+        return f"Google Maps API error ({status}): {message}"
+    if isinstance(exc, TransportError):
+        return f"Google Maps transport error: {exc}"
+    return f"Google Maps lookup error: {exc.__class__.__name__}"
+
 
 class GoogleMapsSkillContainer(Module):
     _latest_location: LatLon | None = None
@@ -83,8 +98,9 @@ class GoogleMapsSkillContainer(Module):
             if self._client is None:
                 return "Google Maps is not configured (missing API key)."
             result = self._client.get_location_context(location, radius=context_radius)
-        except Exception:
-            return "There is an issue with the Google Maps API."
+        except Exception as exc:
+            logger.warning("Google Maps where_am_i failed", error=str(exc))
+            return _google_maps_error_message(exc)
 
         if not result:
             return "Could not find anything about the current location."
@@ -113,11 +129,13 @@ class GoogleMapsSkillContainer(Module):
         for query in queries:
             try:
                 if self._client is None:
-                    latlon = None
+                    results.append("Google Maps is not configured (missing API key).")
                     continue
                 latlon = self._client.get_position(query, location)
-            except Exception:
-                latlon = None
+            except Exception as exc:
+                logger.warning("Google Maps position lookup failed", query=query, error=str(exc))
+                results.append(_google_maps_error_message(exc))
+                continue
             if latlon:
                 results.append(latlon.model_dump())
             else:

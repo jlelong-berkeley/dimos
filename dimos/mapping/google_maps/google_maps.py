@@ -42,36 +42,54 @@ class GoogleMaps:
         self._max_nearby_places = 6
 
     def get_position(self, query: str, current_location: LatLon | None = None) -> Position | None:
-        # Use location bias if current location is provided
-        if current_location:
-            geocode_results = self._client.geocode(
-                query,
-                bounds={
-                    "southwest": {
-                        "lat": current_location.lat - 0.5,
-                        "lng": current_location.lon - 0.5,
-                    },
-                    "northeast": {
-                        "lat": current_location.lat + 0.5,
-                        "lng": current_location.lon + 0.5,
-                    },
-                },
-            )
-        else:
-            geocode_results = self._client.geocode(query)
+        geocode_error: Exception | None = None
 
-        if not geocode_results:
+        # Use location bias if current location is provided
+        try:
+            if current_location:
+                geocode_results = self._client.geocode(
+                    query,
+                    bounds={
+                        "southwest": {
+                            "lat": current_location.lat - 0.5,
+                            "lng": current_location.lon - 0.5,
+                        },
+                        "northeast": {
+                            "lat": current_location.lat + 0.5,
+                            "lng": current_location.lon + 0.5,
+                        },
+                    },
+                )
+            else:
+                geocode_results = self._client.geocode(query)
+        except Exception as exc:
+            geocode_error = exc
+            geocode_results = []
+
+        if geocode_results:
+            result = geocode_results[0]
+            location = result["geometry"]["location"]
+            return Position(
+                lat=location["lat"],
+                lon=location["lng"],
+                description=result["formatted_address"],
+            )
+
+        try:
+            place = self.get_position_with_places(query, current_location)
+        except Exception as exc:
+            if geocode_error is not None:
+                raise geocode_error from exc
+            raise
+        if not place:
+            if geocode_error is not None:
+                raise geocode_error
             return None
 
-        result = geocode_results[0]
-
-        location = result["geometry"]["location"]
-
-        return Position(
-            lat=location["lat"],
-            lon=location["lng"],
-            description=result["formatted_address"],
-        )
+        description = place.description
+        if place.address:
+            description = f"{place.description}, {place.address}" if description else place.address
+        return Position(lat=place.lat, lon=place.lon, description=description)
 
     def get_position_with_places(
         self, query: str, current_location: LatLon | None = None

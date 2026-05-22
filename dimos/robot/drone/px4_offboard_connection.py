@@ -29,7 +29,8 @@ from dimos.utils.logging_config import setup_logger
 logger = setup_logger()
 
 POSITION_VELOCITY_TYPE_MASK = 0b0000111111000000
-VELOCITY_LOOKAHEAD_S = 2.0
+VELOCITY_ONLY_TYPE_MASK = 0b0000111111000111
+HORIZONTAL_VELOCITY_ALTITUDE_TYPE_MASK = 0b0000110111100011
 PX4_FORCE_ARM_MAGIC = 21196.0
 PX4_SITL_DEMO_PARAMS = (
     ("NAV_DLL_ACT", 0.0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
@@ -39,8 +40,16 @@ PX4_SITL_DEMO_PARAMS = (
     ("COM_OF_LOSS_T", 10.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
     ("COM_FAIL_ACT_T", 0.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
     ("COM_LOW_BAT_ACT", 0.0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+    ("COM_FLTT_LOW_ACT", 0.0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
     ("COM_DISARM_PRFLT", 60.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
     ("COM_ARM_BAT_MIN", -1.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+    ("CBRK_SUPPLY_CHK", 894281.0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
+    ("BAT_LOW_THR", 0.12, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+    ("BAT_CRIT_THR", 0.05, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+    ("BAT_EMERGEN_THR", 0.03, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+    ("MPC_TKO_SPEED", 2.5, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+    ("MPC_Z_VEL_MAX_UP", 3.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+    ("MPC_Z_V_AUTO_UP", 3.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
 )
 PX4_REQUIRED_ARM_SENSOR_MASK = (
     mavutil.mavlink.MAV_SYS_STATUS_SENSOR_3D_GYRO
@@ -148,18 +157,22 @@ class PX4OffboardDrone:
     def connect(self, timeout: float = 30.0) -> bool:
         """Open the MAVLink connection and wait for a PX4 heartbeat."""
         try:
-            logger.info("Connecting PX4 drone", key=self.config.key, connection=self.config.connection_string)
+            logger.info(
+                "Connecting PX4 drone",
+                key=self.config.key,
+                connection=self.config.connection_string,
+            )
             self.master = mavutil.mavlink_connection(
                 self.config.connection_string,
                 source_system=self.config.source_system,
                 autoreconnect=True,
             )
-            heartbeat = self.master.wait_heartbeat(timeout=timeout)
+            heartbeat = self._wait_vehicle_heartbeat(timeout=timeout)
             if heartbeat is None:
                 logger.error("No PX4 heartbeat", key=self.config.key)
                 return False
-            self.target_system = int(self.master.target_system)
-            self.target_component = int(self.master.target_component)
+            self.target_system = int(heartbeat.get_srcSystem())
+            self.target_component = int(heartbeat.get_srcComponent())
             self.snapshot.connected = True
             self._handle_heartbeat(heartbeat)
             self.request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 30.0)
@@ -174,6 +187,19 @@ class PX4OffboardDrone:
             logger.error("PX4 connection failed", key=self.config.key, error=str(exc))
             self.snapshot.connected = False
             return False
+
+    def _wait_vehicle_heartbeat(self, timeout: float) -> Any | None:
+        """Wait for a vehicle heartbeat, ignoring QGC and other forwarded MAVLink clients."""
+        if self.master is None:
+            return None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            msg = self.master.recv_match(type="HEARTBEAT", blocking=True, timeout=0.2)
+            if msg is None:
+                continue
+            if self._is_vehicle_heartbeat(msg):
+                return msg
+        return None
 
     def request_message_interval(self, message_id: int, hz: float) -> None:
         """Request a telemetry message stream rate from PX4."""
@@ -208,21 +234,47 @@ class PX4OffboardDrone:
             return self.snapshot
         deadline = time.time() + timeout
         with self._io_lock:
+            if self.master is None:
+                return self.snapshot
             while True:
                 msg = self.master.recv_match(blocking=False)
                 if msg is not None:
                     self._handle_message(msg)
+                    continue
                 if timeout <= 0.0 or time.time() >= deadline:
                     return self.snapshot
                 time.sleep(0.002)
 
     def send_velocity_enu(self, velocity_enu: np.ndarray[Any, Any] | list[float]) -> bool:
         """Send a world-frame ENU velocity setpoint to PX4 Offboard."""
+        return self.send_velocity_only_enu(velocity_enu)
+
+    def send_velocity_only_enu(self, velocity_enu: np.ndarray[Any, Any] | list[float]) -> bool:
+        """Send a world-frame ENU velocity-only setpoint to PX4 Offboard."""
         if self.master is None:
             return False
-        velocity = np.asarray(velocity_enu, dtype=float)
-        position = np.asarray(self.snapshot.position_enu, dtype=float) + (velocity * VELOCITY_LOOKAHEAD_S)
-        return self.send_position_velocity_enu(position, velocity)
+        with self._io_lock:
+            self.send_gcs_heartbeat()
+            velocity = np.asarray(velocity_enu, dtype=float)
+            self.master.mav.set_position_target_local_ned_send(
+                int(time.time() * 1000) & 0xFFFFFFFF,
+                self.target_system,
+                self.target_component,
+                mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                VELOCITY_ONLY_TYPE_MASK,
+                0,
+                0,
+                0,
+                float(velocity[0]),
+                float(velocity[1]),
+                -float(velocity[2]),
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+        return True
 
     def send_position_velocity_enu(
         self,
@@ -253,6 +305,38 @@ class PX4OffboardDrone:
                 0,
                 0,
                 0,
+            )
+        return True
+
+    def send_horizontal_velocity_altitude_enu(
+        self,
+        altitude_enu_m: float,
+        velocity_enu: np.ndarray[Any, Any] | list[float],
+    ) -> bool:
+        """Send ENU x/y velocity while PX4 holds an ENU altitude setpoint."""
+        if self.master is None:
+            return False
+        with self._io_lock:
+            self.send_gcs_heartbeat()
+            velocity = np.asarray(velocity_enu, dtype=float)
+            local_altitude = float(altitude_enu_m) - float(self.origin_enu[2])
+            self.master.mav.set_position_target_local_ned_send(
+                int(time.time() * 1000) & 0xFFFFFFFF,
+                self.target_system,
+                self.target_component,
+                mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                HORIZONTAL_VELOCITY_ALTITUDE_TYPE_MASK,
+                float("nan"),
+                float("nan"),
+                -local_altitude,
+                float(velocity[0]),
+                float(velocity[1]),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                float("nan"),
             )
         return True
 
@@ -357,7 +441,9 @@ class PX4OffboardDrone:
             if self._is_px4_mode(snapshot, mode_upper):
                 return True
             time.sleep(0.05)
-        self.snapshot.last_status_text = f"Mode change to {mode_upper} was accepted but not confirmed"
+        self.snapshot.last_status_text = (
+            f"Mode change to {mode_upper} was accepted but not confirmed"
+        )
         return False
 
     def request_mode(self, mode: str) -> bool:
@@ -477,7 +563,9 @@ class PX4OffboardDrone:
                         continue
                     if abs(float(msg.param_value) - float(value)) <= 1.0e-3:
                         return True
-        logger.warning("PX4 parameter was not confirmed", key=self.config.key, name=name, value=value)
+        logger.warning(
+            "PX4 parameter was not confirmed", key=self.config.key, name=name, value=value
+        )
         return False
 
     def core_sensor_failures(self) -> list[str]:
@@ -520,7 +608,10 @@ class PX4OffboardDrone:
             or "timeout" in lower_text
             or "flight termination" in lower_text
         )
-        if self.snapshot.last_status_severity <= mavutil.mavlink.MAV_SEVERITY_ERROR or has_failure_text:
+        if (
+            self.snapshot.last_status_severity <= mavutil.mavlink.MAV_SEVERITY_ERROR
+            or has_failure_text
+        ):
             return text
         return ""
 
@@ -543,10 +634,10 @@ class PX4OffboardDrone:
 
     def close(self) -> None:
         """Close the MAVLink connection."""
-        if self.master is not None:
-            with self._io_lock:
+        with self._io_lock:
+            if self.master is not None:
                 self.master.close()
-            self.master = None
+                self.master = None
         self.snapshot.connected = False
 
     def _send_command(self, command: int, timeout: float = 2.0) -> bool:
@@ -578,6 +669,8 @@ class PX4OffboardDrone:
                 msg = self.master.recv_match(blocking=True, timeout=0.2)
                 if msg is None:
                     continue
+                if not self._is_from_vehicle(msg):
+                    continue
                 self._handle_message(msg)
                 if msg.get_type() != "COMMAND_ACK" or int(msg.command) != int(command):
                     continue
@@ -595,6 +688,8 @@ class PX4OffboardDrone:
             return False
 
     def _handle_message(self, msg: Any) -> None:
+        if not self._is_from_vehicle(msg):
+            return
         msg_type = msg.get_type()
         if msg_type == "HEARTBEAT":
             self._handle_heartbeat(msg)
@@ -632,7 +727,9 @@ class PX4OffboardDrone:
         elif msg_type == "COMMAND_ACK":
             command = int(getattr(msg, "command", 0))
             result = int(getattr(msg, "result", -1))
-            self.snapshot.last_command_ack = f"{self._command_name(command)}={self._mav_result_name(result)}"
+            self.snapshot.last_command_ack = (
+                f"{self._command_name(command)}={self._mav_result_name(result)}"
+            )
             self.snapshot.last_update_s = time.time()
 
     def _handle_heartbeat(self, msg: Any) -> None:
@@ -641,10 +738,33 @@ class PX4OffboardDrone:
         self.snapshot.custom_mode = int(getattr(msg, "custom_mode", 0))
         self.snapshot.armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
         try:
-            self.snapshot.mode = self._px4_mode_name(self.snapshot.base_mode, self.snapshot.custom_mode)
+            self.snapshot.mode = self._px4_mode_name(
+                self.snapshot.base_mode, self.snapshot.custom_mode
+            )
         except Exception:
             self.snapshot.mode = str(getattr(msg, "custom_mode", "UNKNOWN"))
         self.snapshot.last_update_s = time.time()
+
+    def _is_from_vehicle(self, msg: Any) -> bool:
+        """Return whether a MAVLink message came from this PX4 vehicle."""
+        try:
+            source_system = int(msg.get_srcSystem())
+        except Exception:
+            return True
+        return source_system == int(self.target_system)
+
+    @staticmethod
+    def _is_vehicle_heartbeat(msg: Any) -> bool:
+        """Return whether a heartbeat belongs to a vehicle autopilot, not QGC or DimOS."""
+        try:
+            vehicle_type = int(getattr(msg, "type", 0))
+            autopilot = int(getattr(msg, "autopilot", 0))
+        except Exception:
+            return False
+        return (
+            vehicle_type != mavutil.mavlink.MAV_TYPE_GCS
+            and autopilot != mavutil.mavlink.MAV_AUTOPILOT_INVALID
+        )
 
     def _drain_messages(self, message_type: str) -> None:
         if self.master is None:

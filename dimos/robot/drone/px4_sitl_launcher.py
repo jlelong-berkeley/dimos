@@ -28,6 +28,10 @@ from typing import Any
 
 import numpy as np
 
+DEFAULT_PX4_HOME_LAT = 37.2361388889
+DEFAULT_PX4_HOME_LON = -121.9661666667
+DEFAULT_PX4_HOME_ALT = 0.0
+
 
 class PX4SITLSwarmLauncher:
     """Launch PX4 SITL instances without commanding them."""
@@ -46,6 +50,9 @@ class PX4SITLSwarmLauncher:
         clean: bool = True,
         first_spawn_delay_s: float = 4.0,
         spawn_delay_s: float = 2.0,
+        home_lat: float = DEFAULT_PX4_HOME_LAT,
+        home_lon: float = DEFAULT_PX4_HOME_LON,
+        home_alt: float = DEFAULT_PX4_HOME_ALT,
     ) -> None:
         self.px4_dir = px4_dir
         self.n_drones = n_drones
@@ -59,6 +66,9 @@ class PX4SITLSwarmLauncher:
         self.clean = clean
         self.first_spawn_delay_s = first_spawn_delay_s
         self.spawn_delay_s = spawn_delay_s
+        self.home_lat = home_lat
+        self.home_lon = home_lon
+        self.home_alt = home_alt
         self.processes: list[subprocess.Popen[bytes]] = []
         self._log_handles: list[Any] = []
 
@@ -99,6 +109,9 @@ class PX4SITLSwarmLauncher:
                     "PX4_GZ_NO_FOLLOW": "1",
                     "PX4_SIM_SPEED_FACTOR": str(self.speed_factor),
                     "GZ_IP": "127.0.0.1",
+                    "PX4_HOME_LAT": f"{self.home_lat:.10f}",
+                    "PX4_HOME_LON": f"{self.home_lon:.10f}",
+                    "PX4_HOME_ALT": str(self.home_alt),
                 }
             )
             if self.headless:
@@ -128,6 +141,7 @@ class PX4SITLSwarmLauncher:
 
         self._configure_gui_camera()
         print("Launched PX4/Gazebo swarm:")
+        print(f"  home: lat={self.home_lat:.10f}, lon={self.home_lon:.10f}, alt={self.home_alt:.1f}m")
         for offset, pose in enumerate(positions):
             instance = self.instance_start + offset
             port = 14540 + instance if instance <= 9 else 14549
@@ -216,6 +230,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-clean", action="store_true", help="Reuse prior PX4 instance work directories")
     parser.add_argument("--first-spawn-delay", type=float, default=4.0)
     parser.add_argument("--spawn-delay", type=float, default=2.0)
+    parser.add_argument("--home-lat", type=float, default=DEFAULT_PX4_HOME_LAT)
+    parser.add_argument("--home-lon", type=float, default=DEFAULT_PX4_HOME_LON)
+    parser.add_argument("--home-alt", type=float, default=DEFAULT_PX4_HOME_ALT)
     return parser.parse_args()
 
 
@@ -235,6 +252,9 @@ def main() -> int:
         clean=not args.no_clean,
         first_spawn_delay_s=args.first_spawn_delay,
         spawn_delay_s=args.spawn_delay,
+        home_lat=args.home_lat,
+        home_lon=args.home_lon,
+        home_alt=args.home_alt,
     )
     launcher.launch()
     try:

@@ -14,6 +14,7 @@
 
 import re
 
+from googlemaps.exceptions import ApiError
 from langchain_core.messages import HumanMessage
 import pytest
 
@@ -61,10 +62,24 @@ class FakePositionClient:
         return next(self._positions)
 
 
+class FakeFailingPositionClient:
+    def get_position(self, query, location):
+        raise ApiError("REQUEST_DENIED", "Geocoding API has not been used in project")
+
+
 class MockedPositionSkill(GoogleMapsSkillContainer):
     def __init__(self):
         Module.__init__(self)
         self._client = FakePositionClient()
+        self._latest_location = LatLon(lat=37.782654, lon=-122.413273)
+        self._started = True
+        self._max_valid_distance = 20000
+
+
+class MockedFailingPositionSkill(GoogleMapsSkillContainer):
+    def __init__(self):
+        Module.__init__(self)
+        self._client = FakeFailingPositionClient()
         self._latest_location = LatLon(lat=37.782654, lon=-122.413273)
         self._started = True
         self._max_valid_distance = 20000
@@ -94,3 +109,14 @@ def test_get_gps_position_for_queries(agent_setup) -> None:
 
     regex = r".*37\.782601.*122\.413201.*37\.782602.*122\.413202.*37\.782603.*122\.413203.*"
     assert re.match(regex, history[-1].content, re.DOTALL)
+
+
+def test_get_gps_position_for_queries_reports_google_api_errors() -> None:
+    skill = MockedFailingPositionSkill()
+    try:
+        result = skill.get_gps_position_for_queries(["Starbucks"])
+    finally:
+        skill.stop()
+
+    assert "REQUEST_DENIED" in result
+    assert "Geocoding API has not been used" in result
