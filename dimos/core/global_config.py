@@ -55,6 +55,10 @@ class GlobalConfig(BaseSettings):
     dtop: bool = False
     obstacle_avoidance: bool = True
     detection_model: VlModelName = "moondream"
+    px4_hw_n_drones: int = 1
+    px4_hw_min_separation_m: float | None = None
+    px4_hw_auto_origin: bool = True
+    px4_hw_bench_force_arm: bool = False
 
     model_config = SettingsConfigDict(
         env_file=".env",

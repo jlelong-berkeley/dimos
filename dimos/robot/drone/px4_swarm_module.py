@@ -54,6 +54,21 @@ MOTION_TIMEOUT_HOLD_S = 1.0
 MOTION_PROGRESS_LOG_INTERVAL_S = 5.0
 SWARM_MAX_VERTICAL_SPEED_MPS = 2.0
 NATIVE_TAKEOFF_ALTITUDE_M = 1.5
+PX4_LANDED_STATE_ON_GROUND = 1
+PX4_LANDED_STATE_IN_AIR = 2
+PX4_LANDED_STATE_TAKEOFF = 3
+PX4_LANDED_STATE_LANDING = 4
+PX4_LANDED_STATE_RECENT_S = 3.0
+
+# Per-message telemetry stream rates (Hz). Defaults match SITL behavior; lower them for
+# bandwidth-limited links such as SiK radios via the telemetry_rates_hz constructor arg.
+DEFAULT_TELEMETRY_RATES_HZ = {
+    "local_position": 30.0,
+    "heartbeat": 2.0,
+    "sys_status": 2.0,
+    "global_position": 5.0,
+    "extended_sys_state": 2.0,
+}
 
 
 def _default_connection_strings(n_drones: int) -> list[str]:
@@ -87,6 +102,16 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _meters_per_degree(latitude_deg: float) -> tuple[float, float]:
+    """Return (meters per degree latitude, meters per degree longitude) at a latitude."""
+    lat_rad = math.radians(latitude_deg)
+    meters_per_degree_lat = (
+        111132.92 - 559.82 * math.cos(2.0 * lat_rad) + 1.175 * math.cos(4.0 * lat_rad)
+    )
+    meters_per_degree_lon = 111412.84 * math.cos(lat_rad) - 93.5 * math.cos(3.0 * lat_rad)
+    return meters_per_degree_lat, meters_per_degree_lon
+
+
 class PX4SwarmModule(Module):
     """Manage multiple PX4 drones behind one swarm-aware DimOS skill surface."""
 
@@ -105,6 +130,8 @@ class PX4SwarmModule(Module):
         default_task_altitude_m: float = DEFAULT_TASK_ALTITUDE_M,
         configure_sitl_failsafes: bool = False,
         design_vector: list[float] | None = None,
+        telemetry_rates_hz: dict[str, float] | None = None,
+        auto_origin_from_gps: bool = False,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -120,6 +147,14 @@ class PX4SwarmModule(Module):
             default_task_altitude_m: Default mission altitude in meters.
             configure_sitl_failsafes: True only for local PX4 SITL demos.
             design_vector: Optional replacement for the Project3 optimized design.
+            telemetry_rates_hz: Optional per-message stream rates in Hz (keys:
+                local_position, heartbeat, sys_status, global_position,
+                extended_sys_state). Lower these for bandwidth-limited links such as
+                SiK radios; defaults match SITL.
+            auto_origin_from_gps: When True and more than one drone is connected, align all
+                drones into one ENU frame at startup using each drone's GPS, with drone 0 as
+                the (0, 0, 0) reference. Use on real hardware where per-drone EKF origins are
+                otherwise unknown. Requires a global-position (GPS) fix for every drone.
         """
         super().__init__(*args, **kwargs)
         n_drones = len(connection_strings) if connection_strings else DEFAULT_SWARM_SIZE
@@ -135,7 +170,11 @@ class PX4SwarmModule(Module):
         self.takeoff_altitude_m = takeoff_altitude_m
         self.default_task_altitude_m = default_task_altitude_m
         self.configure_sitl_failsafes = configure_sitl_failsafes
+        self.auto_origin_from_gps = auto_origin_from_gps
         self.design_vector = design_vector or list(PROJECT3_BEST_DESIGN)
+        self._telemetry_rates_hz = dict(DEFAULT_TELEMETRY_RATES_HZ)
+        if telemetry_rates_hz:
+            self._telemetry_rates_hz.update(telemetry_rates_hz)
         self._behavior = SwarmBehaviorLaw.from_design_vector(
             self.design_vector,
             min_separation=self.min_separation_m,
@@ -178,6 +217,11 @@ class PX4SwarmModule(Module):
                     key=key,
                     connection_string=connection_string,
                     origin_enu=origin_tuple,
+                    local_position_hz=self._telemetry_rates_hz["local_position"],
+                    heartbeat_hz=self._telemetry_rates_hz["heartbeat"],
+                    sys_status_hz=self._telemetry_rates_hz["sys_status"],
+                    global_position_hz=self._telemetry_rates_hz["global_position"],
+                    extended_sys_state_hz=self._telemetry_rates_hz["extended_sys_state"],
                 )
             )
             drone.connect(timeout=30.0)
@@ -187,6 +231,12 @@ class PX4SwarmModule(Module):
         self._startup_blocker = self._wait_for_position_stream(timeout_s=30.0)
         if self.configure_sitl_failsafes and self._startup_blocker is None:
             self._startup_blocker = self._configure_sitl_failsafes()
+        if (
+            self.auto_origin_from_gps
+            and len(self._drones) > 1
+            and self._startup_blocker is None
+        ):
+            self._startup_blocker = self._derive_origins_from_gps()
 
         self._running = True
         self._telemetry_thread = Thread(target=self._telemetry_loop, daemon=True)
@@ -413,8 +463,27 @@ class PX4SwarmModule(Module):
         return None
 
     @staticmethod
-    def _snapshot_airborne(snapshot: Any) -> bool:
-        if snapshot.position_enu[2] >= AIRBORNE_ALTITUDE_M:
+    def _snapshot_px4_landed_airborne(snapshot: Any) -> bool | None:
+        landed_state_s = float(getattr(snapshot, "landed_state_s", 0.0))
+        if landed_state_s <= 0.0 or time.time() - landed_state_s > PX4_LANDED_STATE_RECENT_S:
+            return None
+
+        takeoff_detected_s = float(getattr(snapshot, "takeoff_detected_s", 0.0))
+        if snapshot.armed and takeoff_detected_s >= landed_state_s and bool(
+            getattr(snapshot, "takeoff_detected", False)
+        ):
+            return True
+
+        landed_state = int(getattr(snapshot, "landed_state", 0))
+        if landed_state in {PX4_LANDED_STATE_IN_AIR, PX4_LANDED_STATE_TAKEOFF}:
+            return True
+        if landed_state in {PX4_LANDED_STATE_ON_GROUND, PX4_LANDED_STATE_LANDING}:
+            return False
+        return None
+
+    @classmethod
+    def _snapshot_takeoff_detected(cls, snapshot: Any) -> bool:
+        if snapshot.armed and bool(getattr(snapshot, "takeoff_detected", False)):
             return True
         status_recent = time.time() - snapshot.last_status_text_s <= 10.0
         return bool(
@@ -422,6 +491,26 @@ class PX4SwarmModule(Module):
             and status_recent
             and "takeoff detected" in snapshot.last_status_text.lower()
         )
+
+    @classmethod
+    def _snapshot_airborne(cls, snapshot: Any) -> bool:
+        px4_airborne = cls._snapshot_px4_landed_airborne(snapshot)
+        if px4_airborne is not None:
+            return px4_airborne
+        if cls._snapshot_takeoff_detected(snapshot):
+            return True
+        return bool(snapshot.position_enu[2] >= AIRBORNE_ALTITUDE_M)
+
+    @classmethod
+    def _snapshot_native_takeoff_complete(
+        cls, snapshot: Any, min_airborne_altitude: float
+    ) -> bool:
+        px4_airborne = cls._snapshot_px4_landed_airborne(snapshot)
+        if px4_airborne is not None:
+            return px4_airborne
+        if cls._snapshot_takeoff_detected(snapshot):
+            return True
+        return bool(snapshot.position_enu[2] >= min_airborne_altitude)
 
     def _enter_offboard_and_arm_all(self, use_native_takeoff: bool = True) -> str | None:
         time.sleep(2.0)
@@ -529,11 +618,11 @@ class PX4SwarmModule(Module):
     def _native_takeoff_until_airborne(self) -> str | None:
         target_altitude = max(min(self.takeoff_altitude_m, NATIVE_TAKEOFF_ALTITUDE_M), 1.2)
         min_airborne_altitude = min(0.25, target_altitude * 0.25)
-        positions = self._positions_enu()
+        snapshots = [drone.update(timeout=0.03) for drone in self._drones]
         low_drones = [
             drone
-            for drone, position in zip(self._drones, positions, strict=True)
-            if position[2] < min_airborne_altitude
+            for drone, snapshot in zip(self._drones, snapshots, strict=True)
+            if not self._snapshot_native_takeoff_complete(snapshot, min_airborne_altitude)
         ]
         if not low_drones:
             return None
@@ -546,19 +635,17 @@ class PX4SwarmModule(Module):
         next_takeoff_request_s = time.time() + 2.0
         while time.time() < deadline:
             snapshots = [drone.update(timeout=0.03) for drone in self._drones]
-            positions = np.asarray([snapshot.position_enu for snapshot in snapshots], dtype=float)
-            takeoff_detected = [
-                "takeoff detected" in snapshot.last_status_text.lower() for snapshot in snapshots
-            ]
             if all(
-                position[2] >= min_airborne_altitude or detected
-                for position, detected in zip(positions, takeoff_detected, strict=True)
+                self._snapshot_native_takeoff_complete(snapshot, min_airborne_altitude)
+                for snapshot in snapshots
             ):
                 return None
             now = time.time()
             if now >= next_takeoff_request_s:
-                for drone, position in zip(self._drones, positions, strict=True):
-                    if position[2] < min_airborne_altitude:
+                for drone, snapshot in zip(self._drones, snapshots, strict=True):
+                    if not self._snapshot_native_takeoff_complete(
+                        snapshot, min_airborne_altitude
+                    ):
                         drone.request_takeoff(target_altitude)
                 next_takeoff_request_s = now + 2.0
             for drone in self._drones:
@@ -568,21 +655,17 @@ class PX4SwarmModule(Module):
         grace_deadline = time.time() + 3.0
         while time.time() < grace_deadline:
             snapshots = [drone.update(timeout=0.05) for drone in self._drones]
-            positions = np.asarray([snapshot.position_enu for snapshot in snapshots], dtype=float)
             if all(
-                position[2] >= min_airborne_altitude or self._snapshot_airborne(snapshot)
-                for position, snapshot in zip(positions, snapshots, strict=True)
+                self._snapshot_native_takeoff_complete(snapshot, min_airborne_altitude)
+                for snapshot in snapshots
             ):
                 return None
             time.sleep(0.1)
 
         details = []
-        positions = np.asarray(
-            [drone.update(timeout=0.1).position_enu for drone in self._drones],
-            dtype=float,
-        )
-        for drone, position in zip(self._drones, positions, strict=True):
-            if position[2] < min_airborne_altitude:
+        snapshots = [drone.update(timeout=0.1) for drone in self._drones]
+        for drone, snapshot in zip(self._drones, snapshots, strict=True):
+            if not self._snapshot_native_takeoff_complete(snapshot, min_airborne_altitude):
                 details.append(
                     self._drone_failure_detail(
                         drone,
@@ -748,6 +831,63 @@ class PX4SwarmModule(Module):
             )
         return None
 
+    @staticmethod
+    def _snapshot_has_gps(snapshot: Any) -> bool:
+        """Return whether a snapshot carries a usable GPS-backed global position."""
+        return abs(snapshot.lat) > 1.0e-7 and abs(snapshot.lon) > 1.0e-7
+
+    def _derive_origins_from_gps(self, timeout_s: float = 20.0) -> str | None:
+        """Align every drone into one ENU frame from GPS, with drone 0 as the (0,0,0) origin.
+
+        Each PX4 reports LOCAL_POSITION_NED relative to its own EKF origin, so without a shared
+        reference the swarm geometry (and the separation law) is meaningless. This reads each
+        drone's GPS at startup (on the ground, before takeoff) and sets origin_enu[i] to the ENU
+        offset from drone 0's GPS to drone i's GPS. Accuracy is bounded by GPS error
+        (~1-3 m/drone); RTK is required for tight formations.
+        """
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            for drone in self._drones:
+                drone.send_gcs_heartbeat()
+                drone.update(timeout=0.01)
+            if all(self._snapshot_has_gps(drone.snapshot) for drone in self._drones):
+                break
+            time.sleep(0.1)
+
+        missing = [
+            drone.config.key
+            for drone in self._drones
+            if not self._snapshot_has_gps(drone.snapshot)
+        ]
+        if missing:
+            return (
+                "Failed: GPS origin alignment needs a global-position fix for every drone; "
+                f"missing: {missing}. Fly outdoors with GPS, or set px4_hw_auto_origin=false "
+                "for a props-off bench test."
+            )
+
+        reference = self._drones[0].snapshot
+        meters_per_degree_lat, meters_per_degree_lon = _meters_per_degree(reference.lat)
+        derived: list[list[float]] = []
+        for drone in self._drones:
+            snapshot = drone.snapshot
+            north_m = (snapshot.lat - reference.lat) * meters_per_degree_lat
+            east_m = (snapshot.lon - reference.lon) * meters_per_degree_lon
+            # Zero each drone's startup altitude so all share ground = 0. GPS/baro vertical
+            # noise otherwise leaves every drone on its own altitude baseline, which breaks
+            # the airborne check (position_enu[2] >= AIRBORNE_ALTITUDE_M). Assumes the drones
+            # start on a roughly level surface.
+            up_m = -float(snapshot.position_enu[2])
+            drone.origin_enu = np.array([north_m, east_m, up_m], dtype=float)
+            derived.append([float(north_m), float(east_m), float(up_m)])
+        self.origin_positions_enu = derived
+        logger.info(
+            "PX4 swarm origins aligned from GPS",
+            reference=self._drones[0].config.key,
+            origins=[np.round(np.asarray(origin), 2).tolist() for origin in derived],
+        )
+        return None
+
     def _wait_for_position_stream(self, timeout_s: float) -> str | None:
         zeros = np.zeros((len(self._drones), 3), dtype=float)
         deadline = time.time() + max(0.0, timeout_s)
@@ -846,6 +986,27 @@ class PX4SwarmModule(Module):
                 "PX4 swarm could not resume hold after command error", reason=state_failure
             )
 
+    @staticmethod
+    def _recent_history_values(
+        history: list[dict[str, Any]],
+        key: str,
+        *,
+        exclude: set[str] | None = None,
+        limit: int = 4,
+    ) -> list[str]:
+        excluded = exclude or set()
+        values: list[str] = []
+        seen: set[str] = set()
+        for entry in reversed(history):
+            value = str(entry.get(key, "")).strip()
+            if not value or value in excluded or value in seen:
+                continue
+            values.append(value)
+            seen.add(value)
+            if len(values) >= limit:
+                break
+        return list(reversed(values))
+
     def _drone_failure_detail(self, drone: PX4OffboardDrone, reason: str) -> str:
         snapshot = drone.update(timeout=0.0)
         details = [f"{drone.config.key} {reason}"]
@@ -853,6 +1014,26 @@ class PX4SwarmModule(Module):
             details.append(f"ack={snapshot.last_command_ack}")
         if snapshot.last_status_text:
             details.append(f"status={snapshot.last_status_text}")
+        recent_statuses = self._recent_history_values(
+            getattr(snapshot, "status_history", []),
+            "message",
+            exclude={snapshot.last_status_text},
+        )
+        if recent_statuses:
+            details.append("recent_statuses=" + " | ".join(recent_statuses))
+        recent_acks = self._recent_history_values(
+            getattr(snapshot, "command_ack_history", []),
+            "ack",
+            exclude={snapshot.last_command_ack},
+            limit=3,
+        )
+        if recent_acks:
+            details.append("recent_acks=" + " | ".join(recent_acks))
+        landed_state = getattr(snapshot, "landed_state_name", "")
+        if landed_state:
+            details.append(f"landed_state={landed_state}")
+        if getattr(snapshot, "takeoff_detected", False):
+            details.append("takeoff_detected=True")
         if not snapshot.has_local_position:
             details.append("local_position=False")
         return (
@@ -1423,13 +1604,32 @@ class PX4SwarmModule(Module):
             lines.append(
                 f"{drone['key']}: connected={drone['connected']}, armed={drone['armed']}, "
                 f"mode={drone['mode']}, pos=({position[0]:.1f}, {position[1]:.1f}, {position[2]:.1f}), "
-                f"battery={drone['battery_remaining']}, local_pos={drone['has_local_position']}"
+                f"battery={drone['battery_remaining']}, local_pos={drone['has_local_position']}, "
+                f"landed={drone.get('landed_state_name', 'UNKNOWN')}"
             )
             notes = []
             if drone.get("last_command_ack"):
                 notes.append(f"ack={drone['last_command_ack']}")
             if drone.get("last_status_text"):
                 notes.append(f"status={drone['last_status_text']}")
+            if drone.get("takeoff_detected"):
+                notes.append("takeoff_detected=True")
+            recent_statuses = self._recent_history_values(
+                drone.get("status_history", []),
+                "message",
+                exclude={str(drone.get("last_status_text", ""))},
+                limit=3,
+            )
+            if recent_statuses:
+                notes.append("recent_statuses=" + " | ".join(recent_statuses))
+            recent_acks = self._recent_history_values(
+                drone.get("command_ack_history", []),
+                "ack",
+                exclude={str(drone.get("last_command_ack", ""))},
+                limit=2,
+            )
+            if recent_acks:
+                notes.append("recent_acks=" + " | ".join(recent_acks))
             if notes:
                 lines.append("  " + "; ".join(notes))
         distances = state["pairwise_distances_m"]

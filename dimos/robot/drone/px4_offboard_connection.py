@@ -47,6 +47,9 @@ PX4_SITL_DEMO_PARAMS = (
     ("BAT_LOW_THR", 0.12, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
     ("BAT_CRIT_THR", 0.05, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
     ("BAT_EMERGEN_THR", 0.03, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
+    # Disable EKF2 GPS quality checks (PDOP, hAcc, drift, ...) so indoor bench arms despite a
+    # weak GPS fix. Persisted on the FC; revert before outdoor flight (PX4 default ~245).
+    ("EKF2_GPS_CHECK", 0.0, mavutil.mavlink.MAV_PARAM_TYPE_INT32),
     ("MPC_TKO_SPEED", 2.5, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
     ("MPC_Z_VEL_MAX_UP", 3.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
     ("MPC_Z_V_AUTO_UP", 3.0, mavutil.mavlink.MAV_PARAM_TYPE_REAL32),
@@ -63,6 +66,8 @@ PX4_REQUIRED_ARM_SENSOR_NAMES = (
     (mavutil.mavlink.MAV_SYS_STATUS_SENSOR_3D_MAG, "compass"),
     (mavutil.mavlink.MAV_SYS_STATUS_SENSOR_ABSOLUTE_PRESSURE, "barometer"),
 )
+PX4_STATUS_HISTORY_LIMIT = 12
+PX4_COMMAND_ACK_HISTORY_LIMIT = 12
 
 
 @dataclass(frozen=True)
@@ -73,6 +78,11 @@ class PX4DroneConfig:
     connection_string: str
     origin_enu: tuple[float, float, float] = (0.0, 0.0, 0.0)
     source_system: int = 250
+    local_position_hz: float = 30.0
+    heartbeat_hz: float = 2.0
+    sys_status_hz: float = 2.0
+    global_position_hz: float = 5.0
+    extended_sys_state_hz: float = 2.0
 
 
 @dataclass
@@ -93,15 +103,23 @@ class PX4DroneSnapshot:
     lat: float = 0.0
     lon: float = 0.0
     relative_alt: float = 0.0
+    amsl_alt: float = 0.0
     last_update_s: float = 0.0
     has_local_position: bool = False
     sensors_present: int = 0
     sensors_enabled: int = 0
     sensors_health: int = 0
+    landed_state: int = 0
+    landed_state_name: str = "MAV_LANDED_STATE_UNDEFINED"
+    landed_state_s: float = 0.0
+    takeoff_detected: bool = False
+    takeoff_detected_s: float = 0.0
     last_command_ack: str = ""
+    command_ack_history: list[dict[str, Any]] = field(default_factory=list)
     last_status_text: str = ""
     last_status_severity: int = 255
     last_status_text_s: float = 0.0
+    status_history: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable snapshot."""
@@ -120,15 +138,23 @@ class PX4DroneSnapshot:
             "lat": self.lat,
             "lon": self.lon,
             "relative_alt": self.relative_alt,
+            "amsl_alt": self.amsl_alt,
             "last_update_s": self.last_update_s,
             "has_local_position": self.has_local_position,
             "sensors_present": self.sensors_present,
             "sensors_enabled": self.sensors_enabled,
             "sensors_health": self.sensors_health,
+            "landed_state": self.landed_state,
+            "landed_state_name": self.landed_state_name,
+            "landed_state_s": self.landed_state_s,
+            "takeoff_detected": self.takeoff_detected,
+            "takeoff_detected_s": self.takeoff_detected_s,
             "last_command_ack": self.last_command_ack,
+            "command_ack_history": list(self.command_ack_history),
             "last_status_text": self.last_status_text,
             "last_status_severity": self.last_status_severity,
             "last_status_text_s": self.last_status_text_s,
+            "status_history": list(self.status_history),
         }
 
 
@@ -175,10 +201,22 @@ class PX4OffboardDrone:
             self.target_component = int(heartbeat.get_srcComponent())
             self.snapshot.connected = True
             self._handle_heartbeat(heartbeat)
-            self.request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, 30.0)
-            self.request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT, 2.0)
-            self.request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 2.0)
-            self.request_message_interval(mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, 5.0)
+            self.request_message_interval(
+                mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED, self.config.local_position_hz
+            )
+            self.request_message_interval(
+                mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT, self.config.heartbeat_hz
+            )
+            self.request_message_interval(
+                mavutil.mavlink.MAVLINK_MSG_ID_SYS_STATUS, self.config.sys_status_hz
+            )
+            self.request_message_interval(
+                mavutil.mavlink.MAVLINK_MSG_ID_GLOBAL_POSITION_INT, self.config.global_position_hz
+            )
+            self.request_message_interval(
+                mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE,
+                self.config.extended_sys_state_hz,
+            )
             for _ in range(5):
                 self.send_gcs_heartbeat(force=True)
                 time.sleep(0.05)
@@ -432,7 +470,10 @@ class PX4OffboardDrone:
             )
             accepted = self._wait_command_ack(mavutil.mavlink.MAV_CMD_DO_SET_MODE, timeout=2.0)
             if not accepted:
-                self.snapshot.last_status_text = f"Mode change to {mode_upper} was not accepted"
+                self._record_status_text(
+                    f"Mode change to {mode_upper} was not accepted",
+                    mavutil.mavlink.MAV_SEVERITY_WARNING,
+                )
                 return False
         deadline = time.time() + 2.5
         while time.time() < deadline:
@@ -441,8 +482,9 @@ class PX4OffboardDrone:
             if self._is_px4_mode(snapshot, mode_upper):
                 return True
             time.sleep(0.05)
-        self.snapshot.last_status_text = (
-            f"Mode change to {mode_upper} was accepted but not confirmed"
+        self._record_status_text(
+            f"Mode change to {mode_upper} was accepted but not confirmed",
+            mavutil.mavlink.MAV_SEVERITY_WARNING,
         )
         return False
 
@@ -499,7 +541,8 @@ class PX4OffboardDrone:
                 float("nan"),
                 float("nan"),
                 float("nan"),
-                max(altitude_m, 1.0),
+                # MAV_CMD_NAV_TAKEOFF param7 is AMSL: command current ground AMSL + relative climb.
+                self.snapshot.amsl_alt + max(altitude_m, 1.0),
             )
             return self._wait_command_ack(mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, timeout=5.0)
 
@@ -520,7 +563,8 @@ class PX4OffboardDrone:
                 float("nan"),
                 float("nan"),
                 float("nan"),
-                max(altitude_m, 1.0),
+                # MAV_CMD_NAV_TAKEOFF param7 is AMSL: command current ground AMSL + relative climb.
+                self.snapshot.amsl_alt + max(altitude_m, 1.0),
             )
         return True
 
@@ -591,16 +635,18 @@ class PX4OffboardDrone:
             and (self.snapshot.sensors_health & required) == required
         )
 
-    def recent_critical_status(self, max_age_s: float = 5.0) -> str:
-        """Return a recent PX4 failure status text that should block arming."""
-        self.update(timeout=0.0)
-        text = self.snapshot.last_status_text
-        if not text:
-            return ""
-        if time.time() - self.snapshot.last_status_text_s > max_age_s:
-            return ""
+    @staticmethod
+    def _append_bounded(
+        history: list[dict[str, Any]], entry: dict[str, Any], limit: int
+    ) -> None:
+        history.append(entry)
+        if len(history) > limit:
+            del history[: len(history) - limit]
+
+    @staticmethod
+    def _status_has_failure_text(text: str) -> bool:
         lower_text = text.lower()
-        has_failure_text = (
+        return (
             "preflight fail" in lower_text
             or " fail:" in lower_text
             or " failed" in lower_text
@@ -608,11 +654,59 @@ class PX4OffboardDrone:
             or "timeout" in lower_text
             or "flight termination" in lower_text
         )
-        if (
-            self.snapshot.last_status_severity <= mavutil.mavlink.MAV_SEVERITY_ERROR
-            or has_failure_text
-        ):
-            return text
+
+    def _record_status_text(self, text: str, severity_value: int = 255) -> None:
+        now = time.time()
+        severity = self._severity_name(severity_value)
+        formatted = f"{severity}: {text}"
+        self.snapshot.last_status_text = formatted
+        self.snapshot.last_status_severity = severity_value
+        self.snapshot.last_status_text_s = now
+        self.snapshot.last_update_s = now
+        self._append_bounded(
+            self.snapshot.status_history,
+            {
+                "time_s": now,
+                "severity": severity,
+                "severity_value": severity_value,
+                "text": text,
+                "message": formatted,
+            },
+            PX4_STATUS_HISTORY_LIMIT,
+        )
+        if "takeoff detected" in text.lower():
+            self.snapshot.takeoff_detected = True
+            self.snapshot.takeoff_detected_s = now
+
+    def _record_command_ack_text(self, ack: str) -> None:
+        now = time.time()
+        self.snapshot.last_command_ack = ack
+        self.snapshot.last_update_s = now
+        self._append_bounded(
+            self.snapshot.command_ack_history,
+            {"time_s": now, "ack": ack},
+            PX4_COMMAND_ACK_HISTORY_LIMIT,
+        )
+
+    def _record_command_ack(self, command: int, result: int) -> None:
+        self._record_command_ack_text(
+            f"{self._command_name(command)}={self._mav_result_name(result)}"
+        )
+
+    def recent_critical_status(self, max_age_s: float = 5.0) -> str:
+        """Return a recent PX4 failure status text that should block arming."""
+        self.update(timeout=0.0)
+        now = time.time()
+        for entry in reversed(self.snapshot.status_history):
+            if now - float(entry.get("time_s", 0.0)) > max_age_s:
+                continue
+            message = str(entry.get("message", ""))
+            severity_value = int(entry.get("severity_value", 255))
+            if (
+                severity_value <= mavutil.mavlink.MAV_SEVERITY_ERROR
+                or self._status_has_failure_text(message)
+            ):
+                return message
         return ""
 
     def send_gcs_heartbeat(self, force: bool = False) -> None:
@@ -675,16 +769,11 @@ class PX4OffboardDrone:
                 if msg.get_type() != "COMMAND_ACK" or int(msg.command) != int(command):
                     continue
                 result = int(msg.result)
-                self.snapshot.last_command_ack = (
-                    f"{self._command_name(command)}={self._mav_result_name(result)}"
-                )
-                self.snapshot.last_update_s = time.time()
                 return result in (
                     mavutil.mavlink.MAV_RESULT_ACCEPTED,
                     mavutil.mavlink.MAV_RESULT_IN_PROGRESS,
                 )
-            self.snapshot.last_command_ack = f"{self._command_name(command)}=ACK_TIMEOUT"
-            self.snapshot.last_update_s = time.time()
+            self._record_command_ack_text(f"{self._command_name(command)}=ACK_TIMEOUT")
             return False
 
     def _handle_message(self, msg: Any) -> None:
@@ -714,29 +803,36 @@ class PX4OffboardDrone:
             self.snapshot.lat = float(getattr(msg, "lat", 0)) / 1.0e7
             self.snapshot.lon = float(getattr(msg, "lon", 0)) / 1.0e7
             self.snapshot.relative_alt = float(getattr(msg, "relative_alt", 0)) / 1000.0
+            self.snapshot.amsl_alt = float(getattr(msg, "alt", 0)) / 1000.0
             self.snapshot.last_update_s = time.time()
+        elif msg_type == "EXTENDED_SYS_STATE":
+            landed_state = int(getattr(msg, "landed_state", 0))
+            self.snapshot.landed_state = landed_state
+            self.snapshot.landed_state_name = self._enum_name(
+                "MAV_LANDED_STATE", landed_state, "MAV_LANDED_STATE"
+            )
+            now = time.time()
+            self.snapshot.landed_state_s = now
+            self.snapshot.last_update_s = now
         elif msg_type == "STATUSTEXT":
             text = self._message_text(getattr(msg, "text", ""))
             if text:
                 severity_value = int(getattr(msg, "severity", 255))
-                severity = self._severity_name(severity_value)
-                self.snapshot.last_status_text = f"{severity}: {text}"
-                self.snapshot.last_status_severity = severity_value
-                self.snapshot.last_status_text_s = time.time()
-                self.snapshot.last_update_s = time.time()
+                self._record_status_text(text, severity_value)
         elif msg_type == "COMMAND_ACK":
             command = int(getattr(msg, "command", 0))
             result = int(getattr(msg, "result", -1))
-            self.snapshot.last_command_ack = (
-                f"{self._command_name(command)}={self._mav_result_name(result)}"
-            )
-            self.snapshot.last_update_s = time.time()
+            self._record_command_ack(command, result)
 
     def _handle_heartbeat(self, msg: Any) -> None:
+        was_armed = self.snapshot.armed
         self.snapshot.autopilot = int(getattr(msg, "autopilot", 0))
         self.snapshot.base_mode = int(getattr(msg, "base_mode", 0))
         self.snapshot.custom_mode = int(getattr(msg, "custom_mode", 0))
         self.snapshot.armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+        if was_armed and not self.snapshot.armed:
+            self.snapshot.takeoff_detected = False
+            self.snapshot.takeoff_detected_s = 0.0
         try:
             self.snapshot.mode = self._px4_mode_name(
                 self.snapshot.base_mode, self.snapshot.custom_mode
