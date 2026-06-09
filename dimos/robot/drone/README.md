@@ -150,6 +150,7 @@ The launcher starts `x500_0`, `x500_1`, and `x500_2` in a line at 6 m spacing an
 | `return_to_line_formation` | Move all drones to a line formation |
 | `return_to_launch` | Swarm-aware return above launch positions, then optional land |
 | `px4_native_rtl` | Direct PX4 RTL fallback, bypassing the swarm velocity layer |
+| `emergency_force_disarm_swarm` | Emergency-only PX4 force disarm for all drones; requires `confirm="FORCE_DISARM"` |
 | `get_fleet_state` / `list_drones` | Report positions, modes, battery placeholders, and pairwise distances |
 
 The optimized Project3 behavior is ported into `px4_swarm_behavior.py` and used as the base velocity feed-forward allocator: goal attraction to assigned points plus inter-drone repulsion. DimOS does not import the GA training package at runtime; it uses the fitted design vector copied from `droneWork/Project3/StudentCode/px4_swarm_ga`. Static obstacle avoidance is intentionally not part of this layer.

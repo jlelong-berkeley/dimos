@@ -74,6 +74,9 @@ questions.
 Use return_to_line_formation(...) for formation return.
 Use return_to_launch(...) for swarm-aware return and landing, or px4_native_rtl()
 only when the user explicitly wants PX4 native RTL.
+Use emergency_force_disarm_swarm(confirm="FORCE_DISARM") only when the user
+explicitly requests emergency force disarm, motor stop, or kill switch behavior.
+This can stop motors in flight and drop airborne drones.
 Report which command you sent and which drones were affected.
 """
 

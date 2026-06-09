@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from threading import RLock
 import time
 
-from dimos.robot.drone.px4_offboard_connection import PX4DroneConfig, PX4OffboardDrone
+from dimos.robot.drone.px4_offboard_connection import (
+    PX4_FORCE_ARM_MAGIC,
+    PX4DroneConfig,
+    PX4OffboardDrone,
+)
 from dimos.robot.drone.px4_swarm_module import (
     AIRBORNE_ALTITUDE_M,
     PX4_LANDED_STATE_IN_AIR,
@@ -47,7 +52,7 @@ def test_airborne_gate_prefers_fresh_px4_landed_state_over_local_altitude() -> N
     assert not PX4SwarmModule._snapshot_airborne(snapshot)
 
 
-def test_airborne_gate_accepts_px4_in_air_or_takeoff_state() -> None:
+def test_airborne_gate_accepts_px4_in_air_state() -> None:
     drone = PX4OffboardDrone(PX4DroneConfig(key="x500_0", connection_string="udpin:0"))
     snapshot = drone.snapshot
     snapshot.armed = True
@@ -57,19 +62,44 @@ def test_airborne_gate_accepts_px4_in_air_or_takeoff_state() -> None:
 
     assert PX4SwarmModule._snapshot_airborne(snapshot)
 
+
+def test_takeoff_state_still_needs_altitude_to_complete_native_gate() -> None:
+    drone = PX4OffboardDrone(PX4DroneConfig(key="x500_0", connection_string="udpin:0"))
+    snapshot = drone.snapshot
+    snapshot.armed = True
+    snapshot.position_enu = [0.0, 0.0, 0.0]
     snapshot.landed_state = PX4_LANDED_STATE_TAKEOFF
     snapshot.landed_state_s = time.time()
 
-    assert PX4SwarmModule._snapshot_airborne(snapshot)
+    assert not PX4SwarmModule._snapshot_native_takeoff_complete(
+        snapshot, min_airborne_altitude=0.25
+    )
+
+    snapshot.position_enu = [0.0, 0.0, 0.3]
+
+    assert PX4SwarmModule._snapshot_native_takeoff_complete(
+        snapshot, min_airborne_altitude=0.25
+    )
 
 
-def test_newer_takeoff_detected_overrides_older_landed_state() -> None:
+def test_fresh_on_ground_state_overrides_takeoff_detected_latch() -> None:
     drone = PX4OffboardDrone(PX4DroneConfig(key="x500_0", connection_string="udpin:0"))
     snapshot = drone.snapshot
     snapshot.armed = True
     snapshot.position_enu = [0.0, 0.0, 0.0]
     snapshot.landed_state = PX4_LANDED_STATE_ON_GROUND
     snapshot.landed_state_s = time.time() - 0.2
+    snapshot.takeoff_detected = True
+    snapshot.takeoff_detected_s = time.time()
+
+    assert not PX4SwarmModule._snapshot_airborne(snapshot)
+
+
+def test_takeoff_detected_latch_is_fallback_without_fresh_landed_state() -> None:
+    drone = PX4OffboardDrone(PX4DroneConfig(key="x500_0", connection_string="udpin:0"))
+    snapshot = drone.snapshot
+    snapshot.armed = True
+    snapshot.position_enu = [0.0, 0.0, 0.0]
     snapshot.takeoff_detected = True
     snapshot.takeoff_detected_s = time.time()
 
@@ -87,3 +117,76 @@ def test_newer_landed_state_overrides_older_takeoff_detected() -> None:
     snapshot.landed_state_s = time.time()
 
     assert not PX4SwarmModule._snapshot_airborne(snapshot)
+
+
+class _FakeMav:
+    def __init__(self) -> None:
+        self.command_args: tuple[float, ...] | None = None
+
+    def command_long_send(self, *args: float) -> None:
+        self.command_args = args
+
+
+class _FakeMaster:
+    def __init__(self) -> None:
+        self.mav = _FakeMav()
+
+
+def test_px4_force_disarm_sets_force_magic_param() -> None:
+    drone = PX4OffboardDrone(PX4DroneConfig(key="x500_0", connection_string="udpin:0"))
+    fake_master = _FakeMaster()
+    drone.master = fake_master
+    drone.send_gcs_heartbeat = lambda force=False: None  # type: ignore[method-assign]
+    drone._wait_command_ack = lambda command, timeout: True  # type: ignore[method-assign]
+
+    assert drone.disarm(force=True)
+    assert fake_master.mav.command_args is not None
+    assert fake_master.mav.command_args[4] == 0
+    assert fake_master.mav.command_args[5] == PX4_FORCE_ARM_MAGIC
+
+
+class _FakeDroneConfig:
+    def __init__(self, key: str) -> None:
+        self.key = key
+
+
+class _FakeEmergencyDrone:
+    def __init__(self, key: str) -> None:
+        self.config = _FakeDroneConfig(key)
+        self.disarm_forces: list[bool] = []
+
+    def disarm(self, force: bool = False) -> bool:
+        self.disarm_forces.append(force)
+        return True
+
+
+def _emergency_module() -> tuple[PX4SwarmModule, list[_FakeEmergencyDrone]]:
+    module = PX4SwarmModule.__new__(PX4SwarmModule)
+    drones = [_FakeEmergencyDrone("x500_0"), _FakeEmergencyDrone("x500_1")]
+    module._command_lock = RLock()
+    module._drones = drones  # type: ignore[assignment]
+    module._hold_stop_event = None
+    module._hold_thread = None
+    module._hold_targets = None
+    module._velocity_control_ready = True
+    module._publish_fleet_status = lambda force=False: None  # type: ignore[method-assign]
+    return module, drones
+
+
+def test_emergency_force_disarm_requires_confirmation() -> None:
+    module, drones = _emergency_module()
+
+    result = module.emergency_force_disarm_swarm()
+
+    assert result == "Failed: emergency force disarm requires confirm='FORCE_DISARM'"
+    assert all(not drone.disarm_forces for drone in drones)
+
+
+def test_emergency_force_disarm_passes_force_to_all_drones() -> None:
+    module, drones = _emergency_module()
+
+    result = module.emergency_force_disarm_swarm(confirm="force_disarm")
+
+    assert result == "emergency_force_disarm_swarm sent: x500_0=True, x500_1=True"
+    assert [drone.disarm_forces for drone in drones] == [[True], [True]]
+    assert not module._velocity_control_ready

@@ -59,6 +59,7 @@ PX4_LANDED_STATE_IN_AIR = 2
 PX4_LANDED_STATE_TAKEOFF = 3
 PX4_LANDED_STATE_LANDING = 4
 PX4_LANDED_STATE_RECENT_S = 3.0
+EMERGENCY_FORCE_DISARM_CONFIRMATION = "FORCE_DISARM"
 
 # Per-message telemetry stream rates (Hz). Defaults match SITL behavior; lower them for
 # bandwidth-limited links such as SiK radios via the telemetry_rates_hz constructor arg.
@@ -463,19 +464,18 @@ class PX4SwarmModule(Module):
         return None
 
     @staticmethod
-    def _snapshot_px4_landed_airborne(snapshot: Any) -> bool | None:
+    def _snapshot_recent_landed_state(snapshot: Any) -> int | None:
         landed_state_s = float(getattr(snapshot, "landed_state_s", 0.0))
         if landed_state_s <= 0.0 or time.time() - landed_state_s > PX4_LANDED_STATE_RECENT_S:
             return None
+        return int(getattr(snapshot, "landed_state", 0))
 
-        takeoff_detected_s = float(getattr(snapshot, "takeoff_detected_s", 0.0))
-        if snapshot.armed and takeoff_detected_s >= landed_state_s and bool(
-            getattr(snapshot, "takeoff_detected", False)
-        ):
-            return True
-
-        landed_state = int(getattr(snapshot, "landed_state", 0))
-        if landed_state in {PX4_LANDED_STATE_IN_AIR, PX4_LANDED_STATE_TAKEOFF}:
+    @classmethod
+    def _snapshot_px4_landed_airborne(cls, snapshot: Any) -> bool | None:
+        landed_state = cls._snapshot_recent_landed_state(snapshot)
+        if landed_state is None:
+            return None
+        if landed_state == PX4_LANDED_STATE_IN_AIR:
             return True
         if landed_state in {PX4_LANDED_STATE_ON_GROUND, PX4_LANDED_STATE_LANDING}:
             return False
@@ -497,9 +497,12 @@ class PX4SwarmModule(Module):
         px4_airborne = cls._snapshot_px4_landed_airborne(snapshot)
         if px4_airborne is not None:
             return px4_airborne
-        if cls._snapshot_takeoff_detected(snapshot):
+        landed_state = cls._snapshot_recent_landed_state(snapshot)
+        if snapshot.position_enu[2] >= AIRBORNE_ALTITUDE_M:
             return True
-        return bool(snapshot.position_enu[2] >= AIRBORNE_ALTITUDE_M)
+        if landed_state is None and cls._snapshot_takeoff_detected(snapshot):
+            return True
+        return False
 
     @classmethod
     def _snapshot_native_takeoff_complete(
@@ -508,9 +511,19 @@ class PX4SwarmModule(Module):
         px4_airborne = cls._snapshot_px4_landed_airborne(snapshot)
         if px4_airborne is not None:
             return px4_airborne
-        if cls._snapshot_takeoff_detected(snapshot):
+        landed_state = cls._snapshot_recent_landed_state(snapshot)
+        if snapshot.position_enu[2] >= min_airborne_altitude:
             return True
-        return bool(snapshot.position_enu[2] >= min_airborne_altitude)
+        if landed_state is None and cls._snapshot_takeoff_detected(snapshot):
+            return True
+        return False
+
+    @classmethod
+    def _snapshot_safe_to_disarm_on_ground(cls, snapshot: Any) -> bool:
+        landed_state = cls._snapshot_recent_landed_state(snapshot)
+        if landed_state == PX4_LANDED_STATE_ON_GROUND:
+            return True
+        return bool(snapshot.position_enu[2] <= 0.5 and not cls._snapshot_airborne(snapshot))
 
     def _enter_offboard_and_arm_all(self, use_native_takeoff: bool = True) -> str | None:
         time.sleep(2.0)
@@ -617,7 +630,7 @@ class PX4SwarmModule(Module):
 
     def _native_takeoff_until_airborne(self) -> str | None:
         target_altitude = max(min(self.takeoff_altitude_m, NATIVE_TAKEOFF_ALTITUDE_M), 1.2)
-        min_airborne_altitude = min(0.25, target_altitude * 0.25)
+        min_airborne_altitude = AIRBORNE_ALTITUDE_M
         snapshots = [drone.update(timeout=0.03) for drone in self._drones]
         low_drones = [
             drone
@@ -635,6 +648,11 @@ class PX4SwarmModule(Module):
         next_takeoff_request_s = time.time() + 2.0
         while time.time() < deadline:
             snapshots = [drone.update(timeout=0.03) for drone in self._drones]
+            abort_failure = self._native_takeoff_abort_failure(
+                snapshots, min_airborne_altitude
+            )
+            if abort_failure is not None:
+                return abort_failure
             if all(
                 self._snapshot_native_takeoff_complete(snapshot, min_airborne_altitude)
                 for snapshot in snapshots
@@ -655,6 +673,11 @@ class PX4SwarmModule(Module):
         grace_deadline = time.time() + 3.0
         while time.time() < grace_deadline:
             snapshots = [drone.update(timeout=0.05) for drone in self._drones]
+            abort_failure = self._native_takeoff_abort_failure(
+                snapshots, min_airborne_altitude
+            )
+            if abort_failure is not None:
+                return abort_failure
             if all(
                 self._snapshot_native_takeoff_complete(snapshot, min_airborne_altitude)
                 for snapshot in snapshots
@@ -675,6 +698,33 @@ class PX4SwarmModule(Module):
         if not details:
             return None
         return "Failed: " + "; ".join(details)
+
+    def _native_takeoff_abort_failure(
+        self, snapshots: list[Any], min_airborne_altitude: float
+    ) -> str | None:
+        failures: list[str] = []
+        for drone, snapshot in zip(self._drones, snapshots, strict=True):
+            if self._snapshot_native_takeoff_complete(snapshot, min_airborne_altitude):
+                continue
+            critical_status = drone.recent_critical_status(max_age_s=4.0)
+            if critical_status:
+                failures.append(
+                    self._drone_failure_detail(
+                        drone,
+                        f"reported critical status during takeoff: {critical_status}",
+                    )
+                )
+                continue
+            if snapshot.mode.upper() in {"RTL", "LAND"}:
+                failures.append(
+                    self._drone_failure_detail(
+                        drone,
+                        f"entered {snapshot.mode} during takeoff",
+                    )
+                )
+        if failures:
+            return "Failed: " + "; ".join(failures)
+        return None
 
     def _wait_until_mode(self, mode: str, timeout_s: float) -> str | None:
         deadline = time.time() + max(0.0, timeout_s)
@@ -943,22 +993,26 @@ class PX4SwarmModule(Module):
         self._command_all_for(zeros, seconds=0.2)
         snapshots = [drone.update(timeout=0.02) for drone in self._drones]
         any_airborne = any(
-            snapshot.armed and snapshot.position_enu[2] > AIRBORNE_ALTITUDE_M + 0.3
+            snapshot.armed and self._snapshot_airborne(snapshot)
             for snapshot in snapshots
         )
         if any_airborne:
+            for drone, snapshot in zip(self._drones, snapshots, strict=True):
+                if snapshot.armed and self._snapshot_safe_to_disarm_on_ground(snapshot):
+                    drone.disarm()
             logger.warning(
-                "PX4 control setup failed while airborne; leaving vehicles in current mode"
+                "PX4 control setup failed with at least one vehicle airborne; "
+                "disarmed grounded vehicles and left airborne vehicles in current mode"
             )
             return
         for drone in self._drones:
             snapshot = drone.update(timeout=0.02)
-            if snapshot.armed and snapshot.position_enu[2] <= 0.5:
+            if snapshot.armed and self._snapshot_safe_to_disarm_on_ground(snapshot):
                 drone.disarm()
         time.sleep(0.5)
         for drone in self._drones:
             snapshot = drone.update(timeout=0.02)
-            if snapshot.armed and snapshot.position_enu[2] <= 0.5:
+            if snapshot.armed and self._snapshot_safe_to_disarm_on_ground(snapshot):
                 drone.disarm()
         self._command_all_for(zeros, seconds=0.2)
 
@@ -969,16 +1023,16 @@ class PX4SwarmModule(Module):
             return
         snapshots = [drone.update(timeout=0.02) for drone in self._drones]
         any_airborne = any(
-            snapshot.armed and snapshot.position_enu[2] > AIRBORNE_ALTITUDE_M + 0.3
+            snapshot.armed and self._snapshot_airborne(snapshot)
             for snapshot in snapshots
         )
         if not any_airborne:
             self._cleanup_control_setup_failure()
             return
 
-        hold_points = self._hold_current_positions_for(seconds=0.5)
         state_failure = self._velocity_control_state_failure(require_airborne=True)
         if state_failure is None:
+            hold_points = self._hold_current_positions_for(seconds=0.5)
             self._start_background_hold(hold_points)
         else:
             self._velocity_control_ready = False
@@ -1725,6 +1779,41 @@ class PX4SwarmModule(Module):
             return f"land_swarm {status}: " + ", ".join(results)
 
         return self._run_skill_task(run)
+
+    @skill
+    def emergency_force_disarm_swarm(self, confirm: str = "") -> str:
+        """Immediately force-disarm all PX4 drones for an emergency motor stop.
+
+        Args:
+            confirm: Must be FORCE_DISARM to execute. Force disarm can stop motors in flight.
+        """
+        if confirm.strip().upper() != EMERGENCY_FORCE_DISARM_CONFIRMATION:
+            return "Failed: emergency force disarm requires confirm='FORCE_DISARM'"
+
+        with self._command_lock:
+            self._stop_background_hold()
+            self._velocity_control_ready = False
+            logger.warning(
+                "PX4 emergency force disarm requested",
+                drones=[drone.config.key for drone in self._drones],
+            )
+            results: list[str] = []
+            for drone in self._drones:
+                try:
+                    accepted = drone.disarm(force=True)
+                except Exception as exc:
+                    logger.exception(
+                        "PX4 emergency force disarm failed",
+                        key=drone.config.key,
+                    )
+                    results.append(f"{drone.config.key}=error:{exc}")
+                    continue
+                results.append(f"{drone.config.key}={accepted}")
+            self._publish_fleet_status(force=True)
+
+        if not results:
+            return "emergency_force_disarm_swarm sent: no PX4 drones configured"
+        return "emergency_force_disarm_swarm sent: " + ", ".join(results)
 
     @skill
     def return_to_launch(self, altitude: float = DEFAULT_TASK_ALTITUDE_M, land: bool = True) -> str:

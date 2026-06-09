@@ -400,10 +400,11 @@ class PX4OffboardDrone:
             )
             return self._wait_command_ack(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout=5.0)
 
-    def disarm(self) -> bool:
+    def disarm(self, force: bool = False) -> bool:
         """Disarm the PX4 vehicle."""
         if self.master is None:
             return False
+        force_value = PX4_FORCE_ARM_MAGIC if force else 0.0
         with self._io_lock:
             self.send_gcs_heartbeat(force=True)
             self.master.mav.command_long_send(
@@ -412,7 +413,7 @@ class PX4OffboardDrone:
                 mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
                 0,
                 0,
-                0,
+                force_value,
                 0,
                 0,
                 0,
